@@ -41,32 +41,40 @@ function buildUserPrompt(input) {
 
 function parseModelJson(content) {
   const clean = String(content || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
-  const parsed = JSON.parse(clean);
+  if (!clean) throw Object.assign(new Error('DeepSeek 返回了空内容'), { code: 'EMPTY_MODEL_OUTPUT' });
+  let parsed;
+  try { parsed = JSON.parse(clean); }
+  catch { throw Object.assign(new Error('DeepSeek 返回的 JSON 不完整'), { code: 'INVALID_MODEL_JSON' }); }
   if (!Array.isArray(parsed.duties) || !Array.isArray(parsed.matches) || !parsed.finalResume) throw new Error('模型返回结构不完整');
   return parsed;
 }
 
 async function analyzeResume(input, options = {}) {
   const apiKey = options.apiKey || process.env.DEEPSEEK_API_KEY;
-  const model = options.model || process.env.DEEPSEEK_MODEL || 'deepseek-v4-pro';
+  const model = options.model || process.env.DEEPSEEK_MODEL || 'deepseek-v4-flash';
   if (!apiKey) throw Object.assign(new Error('服务端尚未配置 DEEPSEEK_API_KEY'), { statusCode: 503, code: 'MISSING_API_KEY' });
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 90000);
-  try {
-    const response = await fetch('https://api.deepseek.com/chat/completions', {
-      method: 'POST', signal: controller.signal,
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({ model, messages: [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: buildUserPrompt(input) }], response_format: { type: 'json_object' }, temperature: 0.2, max_tokens: 8000, stream: false })
-    });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw Object.assign(new Error(payload?.error?.message || `DeepSeek 请求失败（HTTP ${response.status}）`), { statusCode: response.status });
-    const content = payload?.choices?.[0]?.message?.content;
-    return { analysis: parseModelJson(content), model: payload.model || model, usage: payload.usage || null };
-  } catch (error) {
-    if (error.name === 'AbortError') throw Object.assign(new Error('DeepSeek 分析超时，请稍后重试'), { statusCode: 504 });
-    throw error;
-  } finally { clearTimeout(timer); }
+  let lastError;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 55000);
+    try {
+      const retryHint = attempt ? '\n上一次输出为空或不完整。请立即从字符 { 开始输出完整 JSON，禁止输出空白或解释。' : '';
+      const response = await fetch('https://api.deepseek.com/chat/completions', {
+        method: 'POST', signal: controller.signal,
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({ model, messages: [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: buildUserPrompt(input) + retryHint }], response_format: { type: 'json_object' }, thinking: { type: 'disabled' }, temperature: 0.2, max_tokens: 6000, stream: false })
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw Object.assign(new Error(payload?.error?.message || `DeepSeek 请求失败（HTTP ${response.status}）`), { statusCode: response.status });
+      const result = parseModelJson(payload?.choices?.[0]?.message?.content);
+      return { analysis: result, model: payload.model || model, usage: payload.usage || null };
+    } catch (error) {
+      lastError = error.name === 'AbortError' ? Object.assign(new Error('DeepSeek 单次分析超时'), { statusCode: 504, code: 'UPSTREAM_TIMEOUT' }) : error;
+      if (!['EMPTY_MODEL_OUTPUT','INVALID_MODEL_JSON','UPSTREAM_TIMEOUT'].includes(lastError.code) || attempt === 1) break;
+    } finally { clearTimeout(timer); }
+  }
+  throw Object.assign(new Error(`${lastError?.message || 'DeepSeek 分析失败'}，已自动重试，请稍后再试`), { statusCode: lastError?.statusCode || 502, code: lastError?.code || 'ANALYZE_FAILED' });
 }
 
 module.exports = { SYSTEM_PROMPT, buildUserPrompt, parseModelJson, analyzeResume };
