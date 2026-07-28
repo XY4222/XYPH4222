@@ -138,6 +138,7 @@ tr:hover td { background: #fdfdfd; }
 .resume-section p { margin: 5px 0; font-size: 12px; }
 .resume-section ul { margin: 7px 0 0; padding-left: 17px; }
 .resume-section li { margin: 5px 0; font-size: 12px; }
+.resume-plain { white-space: pre-wrap; font-family: inherit; font-size: 12px; line-height: 1.85; }
 .resume-item-head { display: flex; justify-content: space-between; gap: 18px; font-weight: 650; }
 .resume-item-head span:last-child { color: var(--muted); font-weight: 400; }
 .risk-strip { padding: 12px 14px; margin-bottom: 16px; color: #805a22; background: var(--amber-bg); border: 1px solid #f0dfbe; border-radius: 8px; font-size: 12px; }

@@ -11,7 +11,7 @@ const example = {
   extra: `ERP 项目主要服务制造业客户；WMS 项目参与过出入库流程重构和移动端扫码功能。会使用 ChatGPT、Coze 做过个人知识库 Demo，了解 RAG 基本流程，但没有正式商业化 AI 产品上线经验。希望保留真实边界，不夸大 AI 经历。`
 };
 
-const analysis = {
+let analysis = {
   duties: ['规划企业级 AI 产品，设计知识库、智能工作流与 Copilot 场景', '深入业务完成需求洞察、方案和原型设计', '协同算法、研发与业务团队推动产品从 0 到 1', '建立指标体系，以数据和反馈驱动迭代'],
   hard: ['3 年以上 B 端产品经验', '可独立完成 PRD、原型和产品规划', '复杂业务抽象、数据分析、跨团队推动', '了解大模型、RAG、Agent 基本原理'],
   implicit: ['能把模型能力转译为可交付业务方案', '理解 AI 效果评估与不确定性管理', '既能做产品定义，也能推动技术交付', '有企业客户场景理解和商业敏感度'],
@@ -68,7 +68,7 @@ const analysis = {
 };
 
 const state = {
-  current: 'input', analyzed: false, answers: Array(8).fill(''), bullets: Array(8).fill(''), style: 'balanced', form: {...example, role:'',industry:'',company:'',stage:'',highlights:[],jd:'',resume:'',extra:''}
+  current: 'input', analyzed: false, answers: Array(8).fill(''), bullets: Array(8).fill(''), style: 'balanced', provider: null, form: {...example, role:'',industry:'',company:'',stage:'',highlights:[],jd:'',resume:'',extra:''}
 };
 
 const $ = (s, root=document) => root.querySelector(s);
@@ -96,7 +96,7 @@ function render() {
 
 function renderInput() {
   const f=state.form, tags=['复杂业务抽象','ToB 产品设计','数据分析能力','AI 产品理解','0-1 产品落地','跨团队推动'];
-  return `${pageHead(1,'输入求职材料','提供目标岗位与真实经历。分析引擎会建立 JD 要求与简历证据的逐项映射。','预计分析耗时 3 秒')}
+  return `${pageHead(1,'输入求职材料','提供目标岗位与真实经历。DeepSeek 会建立 JD 要求与简历证据的逐项映射。','预计分析耗时 30–90 秒')}
   <div class="form-card card"><h2 class="form-section-title"><span class="section-number">1</span>目标岗位</h2>
     <div class="grid two">
       <div class="field"><label>目标岗位 *</label><input id="role" value="${escapeHtml(f.role)}" placeholder="例如：AI 产品经理"></div>
@@ -111,28 +111,29 @@ function renderInput() {
     <div class="form-card card"><h2 class="form-section-title"><span class="section-number">3</span>原始简历</h2><div class="field"><label>当前简历内容 *</label><textarea id="resume" placeholder="粘贴简历全文…">${escapeHtml(f.resume)}</textarea></div></div>
   </div>
   <div class="form-card card"><h2 class="form-section-title"><span class="section-number">4</span>补充信息</h2><div class="field"><label>项目、数据与事实边界 <span class="hint">选填</span></label><textarea id="extra" style="min-height:110px" placeholder="补充代表项目、成果数据、不希望夸大的内容…">${escapeHtml(f.extra)}</textarea></div></div>
-  <div class="form-actions"><p>仅保存在当前浏览器 · 分析结果为本地 Mock 数据</p><div class="action-group"><button class="button secondary" data-action="example">使用示例数据</button><button class="button primary" data-action="analyze">开始分析 <span>→</span></button></div></div>`;
+  <div class="form-actions"><p>API Key 仅存在服务端 · 简历内容将发送至 DeepSeek 分析</p><div class="action-group"><button class="button secondary" data-action="example">使用示例数据</button><button class="button primary" data-action="analyze">使用 DeepSeek 分析 <span>→</span></button></div></div>`;
 }
 
 function renderJD() {
   return `${pageHead(2,'JD 解析','区分招聘方明示要求与合理推断，定位真正决定候选人质量的能力证据。','分析置信度：高')}
   <div class="grid two" style="margin-bottom:16px">
-    ${[['核心职责',analysis.duties,'blue'],['硬性要求',analysis.hard,''],['隐性要求',analysis.implicit,'amber'],['理想候选人', ['有成熟 ToB 产品基本功','能把 AI 能力转译为业务价值','有从需求定义到效果评估的闭环意识','面对技术不确定性仍能推动交付'],'green']].map(([t,items,color])=>`<div class="card card-pad"><div class="card-title-row"><h3 class="card-title">${t}</h3><span class="badge ${color}">${t==='隐性要求'?'合理推断':'JD 依据'}</span></div><ul class="list-clean">${items.map(x=>`<li>${x}</li>`).join('')}</ul></div>`).join('')}
+    ${[['核心职责',analysis.duties,'blue'],['硬性要求',analysis.hard,''],['隐性要求',analysis.implicit,'amber'],['理想候选人', analysis.ideal || ['具备目标岗位核心能力','能够提供可验证的成果证据','经历与业务场景高度相关'],'green']].map(([t,items,color])=>`<div class="card card-pad"><div class="card-title-row"><h3 class="card-title">${t}</h3><span class="badge ${color}">${t==='隐性要求'?'合理推断':'JD 依据'}</span></div><ul class="list-clean">${items.map(x=>`<li>${x}</li>`).join('')}</ul></div>`).join('')}
   </div>
   <div class="card card-pad" style="margin-bottom:16px"><div class="card-title-row"><div><h3 class="card-title">高频关键词</h3><p class="card-subtitle">建议自然嵌入，禁止机械堆砌</p></div><span class="badge">ATS 相关</span></div><div class="keyword-row">${analysis.keywords.map(x=>`<span class="keyword">${x}</span>`).join('')}</div></div>
   <div class="table-wrap"><table><thead><tr><th>核心能力</th><th>重要度</th><th>招聘判断</th><th>置信度</th></tr></thead><tbody>${analysis.capabilities.map(r=>`<tr><td><strong>${r[0]}</strong></td><td><span class="badge ${r[1]==='高'?'red':'amber'}">${r[1]}</span></td><td>${r[2]}</td><td>高</td></tr>`).join('')}</tbody></table></div>${nextButton('diagnosis','查看简历诊断')}`;
 }
 
 function renderDiagnosis() {
+  const score = Math.max(0, Math.min(100, Number(analysis.score ?? 64)));
   return `${pageHead(3,'简历诊断','评分反映当前简历对这份 JD 的证据覆盖程度，不等同于录用概率。','基于 6 个维度')}
-  <div class="card score-hero"><div class="score-ring" style="--score:64"><div class="score-value"><strong>64</strong><span>当前匹配度</span></div></div><div class="score-summary"><span class="badge amber">中等匹配 · 有明显缺口</span><h3>ToB 基本盘扎实，但 AI 产品证据不足</h3><p>最大问题不是“措辞不够高级”，而是关键成果与 AI 实践都缺少可验证证据。先补事实，再重构表达。</p><div class="score-metrics"><div class="metric-mini"><span>主要加分</span><strong>ToB 5年</strong></div><div class="metric-mini"><span>核心缺口</span><strong>AI 落地</strong></div><div class="metric-mini"><span>修改优先项</span><strong>4 项</strong></div><div class="metric-mini"><span>判断置信度</span><strong>中</strong></div></div></div></div>
+  <div class="card score-hero"><div class="score-ring" style="--score:${score}"><div class="score-value"><strong>${score}</strong><span>当前匹配度</span></div></div><div class="score-summary"><span class="badge ${score>=75?'green':score>=55?'amber':'red'}">${score>=75?'较高匹配':score>=55?'中等匹配 · 有明显缺口':'低匹配 · 关键证据不足'}</span><h3>${escapeHtml(analysis.scoreSummary || '岗位证据需要进一步补强')}</h3><p>${escapeHtml(analysis.scoreDescription || '评分基于当前 JD 与简历证据，不代表录用概率。')}</p><div class="score-metrics"><div class="metric-mini"><span>分析模型</span><strong>${escapeHtml(state.provider?.model || 'DeepSeek')}</strong></div><div class="metric-mini"><span>证据映射</span><strong>${analysis.matches.length} 项</strong></div><div class="metric-mini"><span>修改优先项</span><strong>${analysis.issues.length} 项</strong></div><div class="metric-mini"><span>判断置信度</span><strong>中</strong></div></div></div></div>
   <div class="grid two" style="margin-bottom:16px"><div class="card card-pad"><h3 class="card-title">维度评分</h3>${analysis.dimensions.map(([n,v])=>`<div class="dimension-row"><span>${n}</span><div class="progress"><i style="width:${v}%"></i></div><strong>${v}</strong></div>`).join('')}</div><div class="card card-pad"><h3 class="card-title" style="margin-bottom:14px">评分口径</h3><ul class="list-clean"><li><strong>加分：</strong>5 年 ToB、ERP/WMS 场景、具备数据工具基础</li><li><strong>扣分：</strong>AI 仅个人 Demo、结果量化不足、主导程度模糊</li><li><strong>边界：</strong>仅基于用户提供的 JD 与简历文本</li><li><strong>置信度：</strong>中；关键项目结果尚待追问确认</li></ul></div></div>
   <div class="grid two">${analysis.issues.map(([p,t,d,c])=>`<div class="card issue-card"><div class="priority"><span class="badge ${c}">${p}</span><span class="badge">置信度：高</span></div><h4>${t}</h4><p>${d}</p></div>`).join('')}</div>${nextButton('match','查看匹配分析')}`;
 }
 
 function renderMatch() {
   return `${pageHead(4,'JD × 简历匹配分析','逐项检查 JD 要求是否有真实简历证据，并给出补强路径。','覆盖 8 项要求')}
-  <div class="risk-strip">结论：现有材料能证明成熟 ToB 产品能力，但不能证明商业化 AI 产品落地。转型可行，必须正面呈现这一缺口。</div>
+  <div class="risk-strip">结论：${escapeHtml(analysis.scoreDescription || '现有材料存在关键证据缺口，必须正面呈现并补充。')}</div>
   <div class="table-wrap"><table><thead><tr><th>JD 要求</th><th>简历证据</th><th>证据强度</th><th>是否补充</th><th>优化建议</th></tr></thead><tbody>${analysis.matches.map(r=>`<tr><td><strong>${r[0]}</strong></td><td>${r[1]}</td><td><span class="badge ${r[2]==='强'?'green':r[2]==='中'?'amber':'red'}">${r[2]}</span></td><td>${r[3]==='是'?'<span class="badge red">需要</span>':'<span class="badge green">暂不</span>'}</td><td>${r[4]}</td></tr>`).join('')}</tbody></table></div>${nextButton('questions','进入经历追问')}`;
 }
 
@@ -161,6 +162,7 @@ function stylize(text) {
 }
 
 function resumeHtml() {
+  if (analysis.finalResume) return `<article class="resume-paper" id="finalResume"><div class="resume-plain">${escapeHtml(analysis.finalResume)}</div></article>`;
   return `<article class="resume-paper" id="finalResume"><div class="resume-header"><h2>林 晓</h2><p>产品经理 · 5 年经验　|　电话：【待填写】　|　邮箱：【待填写】　|　城市：【待填写】</p></div>
   <section class="resume-section"><h3>求职意向</h3><p><strong>${escapeHtml(state.form.role || 'AI 产品经理')}</strong>｜企业服务 / 人工智能｜${escapeHtml(state.form.company || '成长型科技公司')}</p></section>
   <section class="resume-section"><h3>职业摘要</h3><p>5 年 ToB 产品经验，持续负责 ERP 采购、库存及 WMS 等复杂企业业务场景的需求分析、方案设计与迭代推进。具备业务流程抽象、跨团队协作和数据报表设计经验；主动实践 RAG 知识库 Demo，理解从文档处理、检索召回到回答调优的基础链路。希望将企业软件场景积累迁移至 AI 产品落地。【AI 实践为个人项目，无商业化上线经验】</p></section>
@@ -173,10 +175,10 @@ function resumeHtml() {
 
 function renderInterview() {
   return `${pageHead(7,'面试准备','围绕证据缺口与高风险表达，提前准备可验证、可追溯的回答。','10 个高概率追问')}
-  <div class="risk-strip"><strong>最高风险：</strong>把个人 RAG Demo 表述成商业化 AI 产品经验。建议主动交代边界，再强调 ToB 场景迁移能力。</div>
+  <div class="risk-strip"><strong>最高风险：</strong>${escapeHtml(analysis.highestRisk || analysis.issues?.[0]?.[2] || '面试中无法解释简历中的关键表达。')}</div>
   <div class="grid two" style="margin-bottom:22px">${analysis.interview.map(([q,p],i)=>`<div class="card interview-card"><span class="num">${String(i+1).padStart(2,'0')}</span><div><h4>${q}</h4><p>${p}</p></div></div>`).join('')}</div>
-  <div class="grid two" style="margin-bottom:22px"><div class="card card-pad"><div class="card-title-row"><h3 class="card-title">面试前必须准备的证据</h3><span class="badge red">4 项</span></div><ul class="list-clean"><li>WMS 项目的个人职责、交付物和上线范围</li><li>扫码功能上线前后流程或结果数据</li><li>经营报表的指标口径、用户与决策价值</li><li>知识库 Demo 的结构、测试问题与调优记录</li></ul></div><div class="card card-pad"><div class="card-title-row"><h3 class="card-title">建议补充的数据</h3><span class="badge amber">待确认</span></div><ul class="list-clean"><li>服务客户 / 用户规模及统计时间</li><li>需求版本数、上线周期或采用情况</li><li>减少的操作步骤、错误类型或处理时长</li><li>Demo 语料量、问题集规模与评估标准</li></ul></div></div>
-  <div class="card card-pad"><div class="card-title-row"><div><h3 class="card-title">60 秒自我介绍</h3><p class="card-subtitle">不回避缺口，先建立可迁移能力</p></div><button class="button secondary small" data-action="copy-intro">复制</button></div><div class="intro-box" id="intro">您好，我是林晓，有 5 年 ToB 产品经验，主要负责 ERP 采购、库存、WMS 和经营分析相关产品。我的优势是理解复杂企业流程，并把多角色、多规则的业务问题转化为可落地的产品方案。我目前没有商业化 AI 产品上线经验，这一点我不会回避；但我已经通过个人知识库 Demo 实践了 RAG 的基础链路，也在系统补充 AI 产品评测能力。我希望把企业软件场景理解与 AI 能力结合，重点解决 AI 在真实业务中“场景是否成立、数据是否可用、结果如何评估”的落地问题。</div></div>${nextButton('export','进入导出结果')}`;
+  <div class="grid two" style="margin-bottom:22px"><div class="card card-pad"><div class="card-title-row"><h3 class="card-title">面试前必须准备的证据</h3><span class="badge red">${(analysis.evidenceToPrepare||[]).length || 4} 项</span></div><ul class="list-clean">${(analysis.evidenceToPrepare||['个人职责与团队成果的边界','代表项目的交付物与结果','关键数据的口径与来源','岗位核心能力的真实案例']).map(x=>`<li>${escapeHtml(x)}</li>`).join('')}</ul></div><div class="card card-pad"><div class="card-title-row"><h3 class="card-title">建议补充的数据</h3><span class="badge amber">待确认</span></div><ul class="list-clean">${(analysis.dataGaps||['项目规模与统计时间','关键结果及数据来源','个人贡献与协作范围','业务背景与方案取舍']).map(x=>`<li>${escapeHtml(x)}</li>`).join('')}</ul></div></div>
+  <div class="card card-pad"><div class="card-title-row"><div><h3 class="card-title">60 秒自我介绍</h3><p class="card-subtitle">不回避缺口，先建立可迁移能力</p></div><button class="button secondary small" data-action="copy-intro">复制</button></div><div class="intro-box" id="intro">${escapeHtml(analysis.intro || '请根据真实经历准备自我介绍。')}</div></div>${nextButton('export','进入导出结果')}`;
 }
 
 function renderExport() {
@@ -204,12 +206,25 @@ async function copyText(text,msg='已复制到剪贴板'){ try{ await navigator.
 function getResumeText(){ const el=$('#finalResume'); if(el) return el.innerText; const previous=state.current; state.current='optimize'; const box=document.createElement('div');box.innerHTML=resumeHtml();const text=box.innerText;state.current=previous;return text; }
 function interviewText(){ return '面试准备清单\n\n'+analysis.interview.map((x,i)=>`${i+1}. ${x[0]}\n准备：${x[1]}`).join('\n\n'); }
 
-document.addEventListener('click', e=>{
+document.addEventListener('click', async e=>{
   const step=e.target.closest('[data-step]'); if(step && !step.disabled){ if(state.current==='input') collectForm(); state.current=step.dataset.step; render(); return; }
   const btn=e.target.closest('[data-action]'); if(!btn) return;
   const action=btn.dataset.action;
   if(action==='example'){ state.form={...example,highlights:[...example.highlights]}; render(); showToast('示例数据已填入'); }
-  if(action==='analyze'){ collectForm(); if(!state.form.role||!state.form.jd||!state.form.resume){ showToast('请先填写目标岗位、JD 和原始简历'); return; } btn.disabled=true; btn.innerHTML='正在建立证据映射…'; setTimeout(()=>{state.analyzed=true;state.current='jd';render();showToast('分析完成');},900); }
+  if(action==='analyze'){
+    collectForm();
+    if(!state.form.role||!state.form.jd||!state.form.resume){ showToast('请先填写目标岗位、JD 和原始简历'); return; }
+    btn.disabled=true; btn.innerHTML='DeepSeek 正在分析，可能需要 30–90 秒…';
+    try {
+      const response=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(state.form)});
+      const result=await response.json().catch(()=>({}));
+      if(!response.ok) throw new Error(result.error||`分析请求失败（HTTP ${response.status}）`);
+      analysis={...analysis,...result.analysis};
+      state.provider={model:result.model,usage:result.usage};
+      state.answers=Array(analysis.questions.length).fill(''); state.bullets=Array(analysis.questions.length).fill('');
+      state.analyzed=true; state.current='jd'; render(); showToast(`DeepSeek 分析完成 · ${result.model||'模型'}`);
+    } catch(error) { btn.disabled=false; btn.innerHTML='使用 DeepSeek 分析 <span>→</span>'; showErrorDialog(error.message); }
+  }
   if(action==='generate-bullets'){ $$('[data-answer]').forEach(x=>state.answers[+x.dataset.answer]=x.value.trim()); state.bullets=state.answers.map((a,i)=>a?`${a.replace(/[。！？]+$/,'')}；由此形成可验证的${analysis.questions[i][1].replace('用于','')}证据。`:''); state.current='optimize'; render(); showToast(state.answers.some(Boolean)?'已基于回答生成表达':'已按现有材料生成保守表达'); }
   if(action==='skip-questions'){ state.current='optimize';render(); }
   if(action==='copy-final') copyText(getResumeText(),'最终简历已复制');
@@ -226,5 +241,7 @@ document.addEventListener('click', e=>{
 document.addEventListener('input', e=>{ if(e.target.matches('[data-answer]')) state.answers[+e.target.dataset.answer]=e.target.value; });
 
 function showResetDialog(){ const d=$('#dialog'); d.innerHTML=`<div class="dialog"><h3>重新开始？</h3><p>当前填写内容和分析结果将被清空。</p><div class="dialog-actions"><button class="button secondary" data-action="close-dialog">取消</button><button class="button primary" id="confirmReset">确认清空</button></div></div>`; d.classList.add('open'); $('#confirmReset').onclick=()=>{state.current='input';state.analyzed=false;state.answers=Array(8).fill('');state.bullets=Array(8).fill('');state.form={...example,role:'',industry:'',company:'',stage:'',highlights:[],jd:'',resume:'',extra:''};d.classList.remove('open');render();showToast('已清空');}; }
+
+function showErrorDialog(message){ const d=$('#dialog'); d.innerHTML=`<div class="dialog"><h3>DeepSeek 分析未完成</h3><p>${escapeHtml(message)}</p><div class="dialog-actions"><button class="button primary" data-action="close-dialog">返回修改</button></div></div>`; d.classList.add('open'); d.setAttribute('aria-hidden','false'); }
 
 render();
