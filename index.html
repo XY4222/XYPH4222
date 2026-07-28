@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="简历专家：基于目标岗位 JD 的定制简历优化 Agent" />
+  <title>简历专家 · JD 定制简历优化 Agent</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="#" aria-label="简历专家首页">
+        <span class="brand-mark">简</span>
+        <span>简历专家</span>
+        <span class="brand-tag">JD 定制 Agent</span>
+      </a>
+      <div class="top-actions">
+        <span class="save-state"><i></i><span>所有内容已本地保存</span></span>
+        <button class="button ghost small" data-action="reset">重新开始</button>
+        <button class="button primary small" data-action="copy-final">复制最终简历</button>
+      </div>
+    </header>
+
+    <div class="body-layout">
+      <aside class="sidebar">
+        <div class="process-label">优化流程</div>
+        <nav id="stepNav" aria-label="简历优化流程"></nav>
+        <div class="sidebar-note">
+          <div class="note-icon">◎</div>
+          <strong>事实边界优先</strong>
+          <p>只优化真实经历。缺失信息会标记为待补充，不虚构成绩。</p>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <div id="pageContent"></div>
+      </main>
+    </div>
+  </div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <div id="dialog" class="dialog-backdrop" aria-hidden="true"></div>
+  <script src="app.js"></script>
+</body>
+</html>
