@@ -1,11 +1,11 @@
 {
-  "name": "resume-expert",
+  "name": "shiguang-marketing-workbench",
   "version": "1.0.0",
   "private": true,
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
     "build": "node build.js",
-    "check": "node --check app.js && node --check server.js && node --check deepseek.js && node --check build.js"
+    "check": "node --check app.js && node --check server.js && node --check build.js"
   }
 }
