@@ -1,7 +1,32 @@
-const http=require('http');const fs=require('fs');const path=require('path');
-const root=__dirname,port=Number(process.env.PORT||4173);const types={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8'};
-async function readBody(req){let raw='';for await(const c of req){raw+=c;if(raw.length>100000)throw Object.assign(new Error('请求内容过大'),{statusCode:413});}return JSON.parse(raw||'{}');}
-function extractItems(payload){let data=payload?.data??payload;if(typeof data==='string'){try{data=JSON.parse(data)}catch{data=[data]}}if(typeof data?.output==='string'){try{data=JSON.parse(data.output)}catch{data=[data.output]}}if(Array.isArray(data))return data;for(const k of ['items','copies','results','content'])if(Array.isArray(data?.[k]))return data[k];return [];}
-async function runCoze(input,env=process.env){if(!env.COZE_API_TOKEN||!env.COZE_WORKFLOW_ID)throw Object.assign(new Error('尚未配置 COZE_API_TOKEN 或 COZE_WORKFLOW_ID'),{statusCode:503});const base=(env.COZE_API_BASE||'https://api.coze.cn').replace(/\/$/,'');const response=await fetch(base+'/v1/workflow/run',{method:'POST',headers:{authorization:'Bearer '+env.COZE_API_TOKEN,'content-type':'application/json'},body:JSON.stringify({workflow_id:env.COZE_WORKFLOW_ID,parameters:input})});const payload=await response.json().catch(()=>({}));if(!response.ok||payload.code&&payload.code!==0)throw Object.assign(new Error(payload.msg||payload.message||`Coze 请求失败（HTTP ${response.status}）`),{statusCode:response.ok?502:response.status});return {items:extractItems(payload),debug_id:payload.debug_url||payload.execute_id||null};}
-http.createServer(async(req,res)=>{const pathname=decodeURIComponent((req.url||'/').split('?')[0]);const json=(status,data)=>{res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store'});res.end(JSON.stringify(data));};if(pathname==='/api/coze/status')return json(200,{configured:Boolean(process.env.COZE_API_TOKEN&&process.env.COZE_WORKFLOW_ID)});if(pathname==='/api/coze/run'&&req.method==='POST'){try{const input=await readBody(req);if(!input.topic||!input.product)throw Object.assign(new Error('请填写新闻方向和商品信息'),{statusCode:400});return json(200,await runCoze(input));}catch(e){return json(e.statusCode||500,{error:e.message||'工作流运行失败'});}}const target=pathname==='/'?'/index.html':pathname,file=path.resolve(root,'.'+target);if(!file.startsWith(root)||!fs.existsSync(file)||fs.statSync(file).isDirectory()){res.writeHead(404);return res.end('Not found');}res.writeHead(200,{'content-type':types[path.extname(file)]||'application/octet-stream','cache-control':'no-store'});fs.createReadStream(file).pipe(res);}).listen(port,'0.0.0.0',()=>console.log(`拾光营销台：http://localhost:${port}`));
-module.exports={runCoze,extractItems};
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const { analyzeResume } = require('./deepseek');
+
+const root = __dirname;
+const types = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml' };
+const port = Number(process.env.PORT || 4173);
+
+http.createServer(async (req, res) => {
+  const pathname = decodeURIComponent((req.url || '/').split('?')[0]);
+  if (pathname === '/api/analyze' && req.method === 'POST') {
+    let raw = '';
+    try {
+      for await (const chunk of req) { raw += chunk; if (raw.length > 120000) throw Object.assign(new Error('请求内容过大'), { statusCode: 413 }); }
+      const input = JSON.parse(raw || '{}');
+      if (!input.role || !input.jd || !input.resume) throw Object.assign(new Error('缺少目标岗位、JD 或原始简历'), { statusCode: 400 });
+      const result = await analyzeResume(input);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(result)); return;
+    } catch (error) {
+      res.writeHead(error.statusCode || 500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: error.message || '分析失败', code: error.code || 'ANALYZE_FAILED' })); return;
+    }
+  }
+  const target = pathname === '/' ? '/index.html' : pathname;
+  const file = path.resolve(root, '.' + target);
+  if (!file.startsWith(root) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
+    res.writeHead(404); res.end('Not found'); return;
+  }
+  res.writeHead(200, { 'Content-Type': types[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-store' });
+  fs.createReadStream(file).pipe(res);
+}).listen(port, '0.0.0.0', () => console.log(`Resume Expert: http://localhost:${port}`));

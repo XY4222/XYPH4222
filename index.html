@@ -3,67 +3,43 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="description" content="拾光营销台：从新闻热点到商品营销文案的一站式 AI 工作台" />
-  <title>拾光营销台 · AI 电商内容工作台</title>
+  <meta name="description" content="简历专家：基于目标岗位 JD 的定制简历优化 Agent" />
+  <title>简历专家 · JD 定制简历优化 Agent</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <div class="shell">
-    <aside class="sidebar">
-      <a class="brand" href="#" aria-label="拾光营销台首页">
-        <span class="brand-mark">拾</span>
-        <span><strong>拾光</strong><small>AI 营销工作台</small></span>
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="#" aria-label="简历专家首页">
+        <span class="brand-mark">简</span>
+        <span>简历专家</span>
+        <span class="brand-tag">JD 定制 Agent</span>
       </a>
-      <nav class="nav" aria-label="主导航">
-        <button class="nav-item active"><span>✦</span>内容生成</button>
-        <button class="nav-item"><span>⌁</span>热点雷达<em>即将上线</em></button>
-        <button class="nav-item"><span>▣</span>商品库<em>即将上线</em></button>
-      </nav>
-      <div class="sidebar-foot">
-        <div class="connection"><i></i><div><strong>Coze 工作流</strong><small id="connectionText">等待检测</small></div></div>
-        <button class="nav-item" id="openSettings"><span>⚙</span>接入设置</button>
+      <div class="top-actions">
+        <span class="save-state"><i></i><span>DeepSeek 安全服务端模式</span></span>
+        <button class="button ghost small" data-action="reset">重新开始</button>
+        <button class="button primary small" data-action="copy-final">复制最终简历</button>
       </div>
-    </aside>
+    </header>
 
-    <main>
-      <header class="topbar">
-        <div><p class="eyebrow">内容生成</p><h1>把今天的热点，变成今天的订单。</h1></div>
-        <div class="top-actions"><span class="date" id="today"></span><button class="avatar" aria-label="用户菜单">M</button></div>
-      </header>
-
-      <section class="command-card">
-        <div class="command-head"><div><span class="step">01</span><h2>设置生成任务</h2></div><span class="hint">由 Coze 自动抓取新闻并匹配商品</span></div>
-        <div class="form-grid">
-          <label>新闻方向<div class="input-wrap"><span>⌕</span><input id="topic" placeholder="例如：AI 数码、夏日出行、健康生活" value="AI 数码与效率生活" /></div></label>
-          <label>商品信息<div class="input-wrap"><span>◇</span><input id="product" placeholder="输入商品名称、卖点或商品库关键词" value="轻量降噪耳机，长续航，通勤场景" /></div></label>
-          <label>发布渠道<select id="channel"><option>小红书</option><option>抖音</option><option>微博</option><option>公众号</option><option>全渠道</option></select></label>
-          <label>生成数量<select id="count"><option value="4">4 条</option><option value="6" selected>6 条</option><option value="8">8 条</option><option value="10">10 条</option></select></label>
+    <div class="body-layout">
+      <aside class="sidebar">
+        <div class="process-label">优化流程</div>
+        <nav id="stepNav" aria-label="简历优化流程"></nav>
+        <div class="sidebar-note">
+          <div class="note-icon">◎</div>
+          <strong>事实边界优先</strong>
+          <p>只优化真实经历。缺失信息会标记为待补充，不虚构成绩。</p>
         </div>
-        <div class="command-foot"><p><i></i>工作流将实时获取公开新闻，通常需要 10–30 秒</p><div><button class="btn secondary" id="loadDemo">加载示例</button><button class="btn primary" id="runWorkflow"><span>✦</span>开始生成</button></div></div>
-      </section>
+      </aside>
 
-      <section class="results-section">
-        <div class="results-head">
-          <div><span class="step">02</span><div><h2>生成结果 <b id="resultCount">0</b></h2><p id="resultMeta">设置任务后，点击开始生成</p></div></div>
-          <div class="filters" id="filters"><button class="active" data-filter="all">全部</button><button data-filter="小红书">小红书</button><button data-filter="抖音">抖音</button><button data-filter="微博">微博</button></div>
-        </div>
-        <div class="empty" id="emptyState"><div class="empty-mark">✦</div><h3>灵感正在新闻里等你</h3><p>运行工作流后，匹配商品的营销文案会以卡片形式出现在这里。</p></div>
-        <div class="loading hidden" id="loadingState"><div class="spinner"></div><h3>正在追踪热点并匹配商品</h3><p id="loadingText">连接 Coze 工作流…</p><div class="progress"><i></i></div></div>
-        <div class="card-grid hidden" id="cardGrid"></div>
-      </section>
-    </main>
+      <main class="workspace">
+        <div id="pageContent"></div>
+      </main>
+    </div>
   </div>
-
-  <dialog id="settingsDialog">
-    <form method="dialog">
-      <div class="dialog-head"><div><p class="eyebrow">工作流接入</p><h2>Coze 配置说明</h2></div><button class="icon-btn" value="cancel" aria-label="关闭">×</button></div>
-      <div class="notice">为保护密钥，生产环境配置由 Sites 服务端环境变量管理，浏览器不会保存 API Token。</div>
-      <dl><div><dt>COZE_API_TOKEN</dt><dd>Coze 个人访问令牌（必填，设为 Secret）</dd></div><div><dt>COZE_WORKFLOW_ID</dt><dd>已发布工作流 ID（必填）</dd></div><div><dt>COZE_API_BASE</dt><dd>默认 https://api.coze.cn；国际区可改为 https://api.coze.com</dd></div></dl>
-      <p class="schema">工作流输入：<code>topic</code>、<code>product</code>、<code>channel</code>、<code>count</code>。输出可为 JSON 数组，或包含 <code>items / copies / results</code> 的对象。</p>
-      <button class="btn primary full" value="cancel">我知道了</button>
-    </form>
-  </dialog>
-  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <div id="dialog" class="dialog-backdrop" aria-hidden="true"></div>
   <script src="app.js"></script>
 </body>
 </html>
