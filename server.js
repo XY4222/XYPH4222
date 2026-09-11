@@ -22,7 +22,7 @@ http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: error.message || '分析失败', code: error.code || 'ANALYZE_FAILED' })); return;
     }
   }
-  const target = pathname === '/' ? '/index.html' : pathname;
+  const target = pathname === '/' ? '/index.html' : (pathname === '/admin' ? '/admin.html' : pathname);
   const file = path.resolve(root, '.' + target);
   if (!file.startsWith(root) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
     res.writeHead(404); res.end('Not found'); return;
