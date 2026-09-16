@@ -261,6 +261,10 @@ const routes = {
     send(res, 200, { items, total: items.length });
   },
 
+  'GET /api/templates': (req, res) => send(res, 200, { items: store.listTemplates() }),
+  'POST /api/templates/:id/create': async (req, res, url, params) => { const body = await readBody(req, ADMIN_LIMIT); send(res, 201, { prompt: store.createPromptFromTemplate(params.id, body, req.auth.username) }); },
+  'POST /api/prompts/batch': async (req, res) => { const body = await readBody(req, ADMIN_LIMIT); send(res, 200, store.batchPromptAction(body.ids, body.action, body, req.auth.username)); },
+
   /** 用户端调用：拿当前生效的 Prompt 配置 */
   'GET /api/prompts/active': (req, res) => {
     const resolved = store.buildPromptConfig();
@@ -437,6 +441,8 @@ function requiredRole(method, pathname) {
   if (PUBLIC_API.has(`${method} ${pathname}`)) return null;
   if (method === 'GET') return 'viewer';
   if (method === 'POST' && pathname === '/api/prompts') return 'editor';
+  if (method === 'POST' && pathname === '/api/prompts/batch') return 'editor';
+  if (method === 'POST' && /^\/api\/templates\/[^/]+\/create$/.test(pathname)) return 'editor';
   if (method === 'PUT' && /^\/api\/prompts\/[^/]+$/.test(pathname)) return 'editor';
   if (method === 'POST' && /^\/api\/prompts\/[^/]+\/(toggle|rollback|submit-review)$/.test(pathname)) return 'editor';
   if (method === 'POST' && /^\/api\/prompts\/[^/]+\/test$/.test(pathname)) return 'editor';

@@ -31,6 +31,7 @@
     testForm: { promptId: '', caseId: '', name: '', role: '', jd: '', resume: '', extra: '', minScore: '0', maxScoreDrop: '5', requiredTerms: '' },
     currentPrompt: null,
     currentVersions: []
+    ,selectedPrompts: [], templates: []
   };
 
   /* ---------- 工具 ---------- */
@@ -371,6 +372,7 @@
       <section class="panel">
         <div class="toolbar">
           <div class="search"><span>⌕</span><input id="search" placeholder="搜索名称、用途或内容" value="${escapeHtml(state.query.q)}" /></div>
+          ${can('editor') ? '<button class="secondary" id="openTemplates">从模板创建</button><button class="secondary" id="batchEnable">批量启用</button><button class="secondary" id="batchDisable">批量停用</button><button class="secondary" id="batchReview">批量提交审核</button>' : ''}
           <select class="filter" id="statusFilter">
             <option value="all"${state.query.status === 'all' ? ' selected' : ''}>全部状态</option>
             <option value="on"${state.query.status === 'on' ? ' selected' : ''}>已启用</option>
@@ -407,7 +409,7 @@
         ? tag('待审核', 'amber')
         : p.releaseStatus === 'draft' ? tag('草稿', 'blue') : tag('已发布', 'green');
       return `<tr>
-        <td>
+        <td><input type="checkbox" class="prompt-select" data-id="${p.id}" ${state.selectedPrompts.includes(String(p.id)) ? 'checked' : ''} aria-label="选择 ${escapeHtml(p.name)}" />
           <div class="prompt-name">${tag(stepTag)}${escapeHtml(p.name)}</div>
           <div class="prompt-meta">${escapeHtml(p.desc || '')}</div>
         </td>
@@ -876,6 +878,10 @@
     clearConnError();
   }
 
+  async function loadTemplates() {
+    const data = await api('/api/templates'); state.templates = data.items || [];
+  }
+
   async function loadPrompts() {
     try {
       await refreshPrompts();
@@ -974,6 +980,20 @@
     if (typeFilter) typeFilter.addEventListener('change', async () => { state.query.type = typeFilter.value; await refreshPrompts(); renderRows(); });
     const newBtn = $('#newBtn');
     if (newBtn) newBtn.addEventListener('click', () => { openDrawer(editorHtml(null)); bindEditor(null); });
+    $$('.prompt-select').forEach(box => box.addEventListener('change', () => { const id = box.dataset.id; state.selectedPrompts = box.checked ? [...new Set([...state.selectedPrompts, id])] : state.selectedPrompts.filter(item => item !== id); }));
+    const batch = async action => {
+      if (!state.selectedPrompts.length) return toast('请先选择 Prompt', true);
+      try { const result = await api('/api/prompts/batch', { method: 'POST', body: { ids: state.selectedPrompts, action } }); state.selectedPrompts = []; await refreshPrompts(); render(); toast(`批量操作完成：成功 ${result.succeeded}，失败 ${result.failed}`, result.failed > 0); }
+      catch (error) { toast(error.message, true); }
+    };
+    const batchEnable = $('#batchEnable'); if (batchEnable) batchEnable.addEventListener('click', () => batch('enable'));
+    const batchDisable = $('#batchDisable'); if (batchDisable) batchDisable.addEventListener('click', () => batch('disable'));
+    const batchReview = $('#batchReview'); if (batchReview) batchReview.addEventListener('click', () => batch('submit-review'));
+    const openTemplates = $('#openTemplates');
+    if (openTemplates) openTemplates.addEventListener('click', async () => {
+      try { await loadTemplates(); openDrawer(`<div class="drawer-head"><div><h2>Prompt 模板</h2><p>模板只用于创建新的草稿，不会直接进入生产。</p></div><button class="close" data-act="close-drawer">×</button></div><div class="vlist">${state.templates.map(template => `<div class="vrow"><div class="vmeta"><div class="vver">${escapeHtml(template.name)}</div><div>${escapeHtml(template.desc || '')}</div><div class="prompt-meta">步骤 ${template.step || '扩展'} · 变量 ${(template.variables || []).join('、') || '无'}</div></div><button class="primary" style="padding:7px 10px" data-template-create="${escapeHtml(template.id)}">创建草稿</button></div>`).join('')}</div>`, true); }
+      catch (error) { toast(error.message, true); }
+    });
     const reloadReleases = $('#reloadReleases');
     if (reloadReleases) reloadReleases.addEventListener('click', async () => { await refreshPrompts(); render(); });
 
@@ -1151,6 +1171,11 @@
 
   // 表格与时间线里的委托事件
   document.addEventListener('click', async event => {
+    const templateButton = event.target.closest('[data-template-create]');
+    if (templateButton) {
+      try { const data = await api(`/api/templates/${encodeURIComponent(templateButton.dataset.templateCreate)}/create`, { method: 'POST', body: {} }); closeDrawer(); await refreshPrompts(); render(); toast(`已创建草稿：${data.prompt.name}`); } catch (error) { toast(error.message, true); }
+      return;
+    }
     const target = event.target.closest('[data-act]');
     if (!target) return;
     const act = target.dataset.act;

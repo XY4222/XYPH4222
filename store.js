@@ -13,6 +13,7 @@ const path = require('path');
  * data/regressions.jsonl —— 回归门禁运行结果，不保存测试输入原文
  * data/feedback.json —— 调用质量反馈，只保存评价元数据
  * data/rules.json —— 输出风险规则与启停状态
+ * data/templates.json —— 可复用 Prompt 模板
  *
  * 原则：版本快照只追加、不覆盖。回滚是「以旧内容生成一个新版本」，不是删除历史。
  */
@@ -27,7 +28,8 @@ const FILES = {
   promptTests: path.join(DATA_DIR, 'prompt-tests.jsonl'),
   regressions: path.join(DATA_DIR, 'regressions.jsonl'),
   feedback: path.join(DATA_DIR, 'feedback.json'),
-  rules: path.join(DATA_DIR, 'rules.json')
+  rules: path.join(DATA_DIR, 'rules.json'),
+  templates: path.join(DATA_DIR, 'templates.json')
 };
 
 const LOG_LIMIT = 5000;
@@ -87,6 +89,10 @@ function ensureData() {
   if (!fs.existsSync(FILES.rules)) writeJson(FILES.rules, [
     { id: 'rule-no-fabrication-terms', name: '禁止虚构承诺', type: 'forbidden_pattern', pattern: '虚构|编造|捏造', severity: 'high', enabled: true, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
     { id: 'rule-review-placeholders', name: '检查未确认占位符', type: 'forbidden_pattern', pattern: '【待补充|【待确认', severity: 'medium', enabled: true, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
+  ]);
+  if (!fs.existsSync(FILES.templates)) writeJson(FILES.templates, [
+    { id: 'tpl-evidence-safe', name: '证据边界检查', type: 'task', stepKey: 'diagnosis', step: 3, desc: '强调事实边界、责任范围和待确认信息', content: '围绕 {{role}} 岗位，检查简历中的职责、结果和数字是否有 {{resume}} 中的事实依据。对无法核验的内容标记【待确认】，不得补写。', variables: ['role', 'resume'], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+    { id: 'tpl-jd-match', name: 'JD 证据映射', type: 'task', stepKey: 'match', step: 4, desc: '将岗位要求映射到候选人证据', content: '将 {{jd}} 的关键要求逐项映射到 {{resume}} 的证据，区分强、中、弱、无，并指出需要补充的事实。', variables: ['jd', 'resume'], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
   ]);
 
   // 兼容旧数据：升级前的每条记录都等同于已经在线生效的生产版本。
@@ -148,6 +154,31 @@ function validatePromptContent(content) {
   const unknown = [...new Set(names.filter(name => !PROMPT_VARIABLES.has(name)))];
   if (unknown.length) throw Object.assign(new Error(`Prompt 包含未知变量：${unknown.join('、')}`), { statusCode: 400, code: 'UNKNOWN_PROMPT_VARIABLE' });
   return [...new Set(names)];
+}
+
+function listTemplates() { return readJson(FILES.templates, []).sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt)); }
+
+function createPromptFromTemplate(templateId, input, actor) {
+  const template = listTemplates().find(item => item.id === templateId);
+  if (!template) throw Object.assign(new Error('Prompt 模板不存在'), { statusCode: 404, code: 'TEMPLATE_NOT_FOUND' });
+  return createPrompt({ ...template, ...input, name: input.name || template.name, content: input.content || template.content, step: input.step === undefined ? template.step : input.step, stepKey: input.stepKey || template.stepKey, type: input.type || template.type, desc: input.desc || template.desc }, actor);
+}
+
+function batchPromptAction(ids, action, input, actor) {
+  if (!Array.isArray(ids) || !ids.length) throw Object.assign(new Error('至少选择一个 Prompt'), { statusCode: 400, code: 'EMPTY_BATCH' });
+  const allowed = new Set(['enable', 'disable', 'submit-review']);
+  if (!allowed.has(action)) throw Object.assign(new Error('批量操作不支持'), { statusCode: 400, code: 'INVALID_BATCH_ACTION' });
+  const results = ids.map(id => {
+    try {
+      let prompt;
+      if (action === 'enable') prompt = setEnabled(id, true, actor);
+      else if (action === 'disable') prompt = setEnabled(id, false, actor);
+      else prompt = submitPromptReview(id, { ...input, actor });
+      if (!prompt) return { id, ok: false, code: 'NOT_FOUND', error: 'Prompt 不存在' };
+      return { id, ok: true, prompt: summarize(prompt) };
+    } catch (error) { return { id, ok: false, code: error.code || 'BATCH_ITEM_FAILED', error: error.message }; }
+  });
+  return { action, total: results.length, succeeded: results.filter(item => item.ok).length, failed: results.filter(item => !item.ok).length, results };
 }
 
 function pushVersion(prompt, action, actor, note) {
@@ -995,6 +1026,7 @@ module.exports = {
   regressionSuiteKey, appendRegression, listRegressions,
   findLog, listFeedback, saveFeedback, updateFeedback, feedbackStats,
   listRules, createRule, updateRule, removeRule, scanRisk,
+  listTemplates, createPromptFromTemplate, batchPromptAction,
   dependencyView,
   validatePromptContent, replacePromptVariables, PROMPT_VARIABLES,
   overview, costOf, bumpVersion
