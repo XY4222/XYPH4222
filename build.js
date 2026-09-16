@@ -101,6 +101,7 @@ function parseModelJson(content) {
 
 function degradationFor(code, retryAfter) {
   const table = {
+    DISABLED: { state: 'paused', retryable: false, message: '分析服务已由管理员暂停' },
     RATE_LIMIT: { state: 'rate_limited', retryable: true, message: '分析请求较多，请稍后重试', defaultWait: 30 },
     UPSTREAM_TIMEOUT: { state: 'timeout', retryable: true, message: '模型响应超时，可重试', defaultWait: 3 },
     MODEL_UNAVAILABLE: { state: 'model_unavailable', retryable: true, message: '模型服务暂时不可用，可稍后重试', defaultWait: 10 },
@@ -109,7 +110,8 @@ function degradationFor(code, retryAfter) {
     MODEL_REQUEST_REJECTED: { state: 'request_rejected', retryable: false, message: '模型服务拒绝了本次请求，请联系管理员检查配置' },
     EMPTY_MODEL_OUTPUT: { state: 'invalid_response', retryable: true, message: '模型未返回有效结果，可重试' },
     INVALID_MODEL_JSON: { state: 'invalid_response', retryable: true, message: '模型返回内容不完整，可重试' },
-    BAD_REQUEST: { state: 'invalid_request', retryable: false, message: '请补全目标岗位、JD 和原始简历' }
+    BAD_REQUEST: { state: 'invalid_request', retryable: false, message: '请补全目标岗位、JD 和原始简历' },
+    PAYLOAD_TOO_LARGE: { state: 'invalid_request', retryable: false, message: '输入内容超过允许长度，请精简后重试' }
   };
   const { defaultWait = 0, ...meta } = table[code] || { state: 'failed', retryable: true, message: '本次分析未完成', defaultWait: 3 };
   const wait = Math.max(0, Math.min(300, Number(retryAfter) || 0));
@@ -124,13 +126,28 @@ function upstreamCode(status) {
   return 'MODEL_REQUEST_REJECTED';
 }
 
+function traceFailure(runId, code, attempts) {
+  console.error(JSON.stringify({ event: 'analysis_failed', runId, code, attempts }));
+}
+
 async function handleAnalyze(request, env) {
-  if (!env.DEEPSEEK_API_KEY) return json({ error: '服务端尚未配置 DEEPSEEK_API_KEY', code: 'MISSING_API_KEY', degradation: degradationFor('MISSING_API_KEY') }, 503);
+  const runId = 'edge-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);
+  if (!env.DEEPSEEK_API_KEY) {
+    traceFailure(runId, 'MISSING_API_KEY', 0);
+    return json({ error: '服务端尚未配置 DEEPSEEK_API_KEY', code: 'MISSING_API_KEY', attempts: 0, runId, degradation: degradationFor('MISSING_API_KEY') }, 503);
+  }
+  if (PROMPT_META.settings.analyzeEnabled === false) {
+    traceFailure(runId, 'DISABLED', 0);
+    return json({ error: '管理员已暂停分析服务', code: 'DISABLED', attempts: 0, runId, degradation: degradationFor('DISABLED') }, 503);
+  }
   const input = await request.json();
-  if (!input.role || !input.jd || !input.resume) return json({ error: '缺少目标岗位、JD 或原始简历', code: 'BAD_REQUEST', degradation: degradationFor('BAD_REQUEST') }, 400);
+  if (!String(input.role || '').trim() || !String(input.jd || '').trim() || !String(input.resume || '').trim()) {
+    traceFailure(runId, 'BAD_REQUEST', 0);
+    return json({ error: '缺少目标岗位、JD 或原始简历', code: 'BAD_REQUEST', attempts: 0, runId, degradation: degradationFor('BAD_REQUEST') }, 400);
+  }
 
   const model = env.DEEPSEEK_MODEL || PROMPT_META.settings.model || 'deepseek-v4-flash';
-  const retries = Number.isFinite(PROMPT_META.settings.retries) ? PROMPT_META.settings.retries : 2;
+  const retries = Math.max(0, Math.min(5, Math.floor(Number(PROMPT_META.settings.retries) || 0)));
   const userPrompt = buildUserPrompt(input, PROMPT_CONFIG);
   let lastError;
   let attempts = 0;
@@ -165,11 +182,12 @@ async function handleAnalyze(request, env) {
         model: payload.model || model,
         usage: payload.usage || null,
         attempts,
+        runId,
         promptConfig: { applied: PROMPT_CONFIG.length, truncated: PROMPT_META.truncated, dropped: PROMPT_META.dropped }
       });
     } catch (error) {
       lastError = error;
-      if (error.name === 'TimeoutError') lastError = Object.assign(new Error('DeepSeek 单次分析超时'), { code: 'UPSTREAM_TIMEOUT' });
+      if (error.name === 'TimeoutError' || error.name === 'AbortError') lastError = Object.assign(new Error('DeepSeek 单次分析超时'), { code: 'UPSTREAM_TIMEOUT' });
       else if (error instanceof TypeError && !error.code) lastError = Object.assign(new Error('DeepSeek 模型服务暂时不可用'), { code: 'MODEL_UNAVAILABLE' });
       const retryable = ['EMPTY_MODEL_OUTPUT', 'INVALID_MODEL_JSON', 'RATE_LIMIT', 'MODEL_UNAVAILABLE', 'UPSTREAM_TIMEOUT'].includes(lastError.code);
       if (!retryable || attempt === retries) break;
@@ -180,7 +198,8 @@ async function handleAnalyze(request, env) {
   const code = lastError?.code || (lastError?.name === 'TimeoutError' ? 'UPSTREAM_TIMEOUT' : 'ANALYZE_FAILED');
   const status = code === 'RATE_LIMIT' ? 429 : code === 'UPSTREAM_TIMEOUT' ? 504 : ['MODEL_UNAVAILABLE', 'MODEL_AUTH_ERROR'].includes(code) ? 503 : 502;
   const degradation = degradationFor(code, lastError?.retryAfter);
-  return json({ error: degradation.message + (attempts > 1 ? '，已自动重试' : ''), code, degradation }, status);
+  traceFailure(runId, code, attempts);
+  return json({ error: degradation.message + (attempts > 1 ? '，已自动重试' : ''), code, attempts, runId, degradation }, status);
 }
 
 export default {
@@ -190,7 +209,13 @@ export default {
     if (pathname === '/api/analyze') {
       if (request.method !== 'POST') return json({ error: '请求方法不支持', code: 'METHOD_NOT_ALLOWED' }, 405);
       try { return await handleAnalyze(request, env); }
-      catch (error) { return json({ error: error.message || '分析失败', code: 'ANALYZE_FAILED' }, 500); }
+      catch (error) {
+        const code = error.code || (error instanceof SyntaxError ? 'BAD_REQUEST' : 'ANALYZE_FAILED');
+        const degradation = degradationFor(code);
+        const runId = 'edge-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);
+        traceFailure(runId, code, 0);
+        return json({ error: degradation.message, code, attempts: 0, runId, degradation }, error.statusCode || (code === 'BAD_REQUEST' ? 400 : 500));
+      }
     }
 
     if (pathname === '/api/prompts/active') {

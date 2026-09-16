@@ -111,7 +111,8 @@ async function analyzeResume(input, options = {}) {
   const model = options.model || process.env.DEEPSEEK_MODEL || settings.model;
   if (!apiKey) throw Object.assign(new Error('服务端尚未配置 DEEPSEEK_API_KEY'), { statusCode: 503, code: 'MISSING_API_KEY' });
 
-  const maxAttempts = Math.max(1, Math.min(6, Number(settings.retries) + 1 || 1));
+  const retryCount = Math.max(0, Math.min(5, Math.floor(Number(settings.retries) || 0)));
+  const maxAttempts = retryCount + 1;
   let lastError;
   let attempts = 0;
 

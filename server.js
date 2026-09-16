@@ -97,7 +97,7 @@ async function handleAnalyze(req, res) {
 
   try {
     input = await readBody(req, BODY_LIMIT);
-    if (!input.role || !input.jd || !input.resume) {
+    if (!String(input.role || '').trim() || !String(input.jd || '').trim() || !String(input.resume || '').trim()) {
       const runId = record({ ok: false, code: 'BAD_REQUEST', error: '缺少目标岗位、JD 或原始简历', latencyMs: Date.now() - started });
       return send(res, 400, { error: '缺少目标岗位、JD 或原始简历', code: 'BAD_REQUEST', runId, degradation: degradationFor('BAD_REQUEST') });
     }
@@ -550,7 +550,11 @@ http.createServer(async (req, res) => {
       try { await handleAnalyze(req, res); }
       catch (error) {
         console.error(`[server] analyze 未捕获异常：${error.message}`);
-        if (!res.headersSent) send(res, 500, { error: '分析失败', code: 'ANALYZE_FAILED' });
+        if (!res.headersSent) {
+          const code = error.code || 'ANALYZE_FAILED';
+          const runId = record({ ok: false, code, error: error.message || '分析失败', latencyMs: 0 });
+          send(res, error.statusCode || 500, { error: degradationFor(code).message, code, runId, degradation: degradationFor(code) });
+        }
       }
       return;
     }
