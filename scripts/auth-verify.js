@@ -98,6 +98,8 @@ async function main() {
     check('查看者不能修改设置', (await request('/api/settings', {
       cookie: viewer.session, method: 'PUT', body: { retries: 1 }
     })).status === 403);
+    const viewerTemplates = await request('/api/templates', { cookie: viewer.session });
+    check('查看者不能编辑模板', (await request(`/api/templates/${viewerTemplates.payload.items[0].id}`, { cookie: viewer.session, method: 'PUT', body: { name: '越权修改' } })).status === 403);
 
     const editor = await login('editor-test', 'Editor-test-482!');
     check('编辑者可以登录', editor.status === 200 && !!editor.session);
@@ -110,6 +112,18 @@ async function main() {
       body: { content: detail.payload.prompt.content + '\n鉴权测试草稿', actor: '伪造管理员' }
     });
     check('编辑者可以保存草稿', edited.status === 200 && edited.payload.prompt.releaseStatus === 'draft');
+    const templates = await request('/api/templates', { cookie: editor.session });
+    const template = templates.payload.items[0];
+    const templateEdited = await request(`/api/templates/${template.id}`, { cookie: editor.session, method: 'PUT', body: { name: `${template.name} 权限测试` } });
+    check('编辑者可以编辑模板', templateEdited.status === 200);
+    const templateVersions = await request(`/api/templates/${template.id}/versions`, { cookie: editor.session });
+    const templateArchived = await request(`/api/templates/${template.id}/archive`, { cookie: editor.session, method: 'POST', body: { archived: true } });
+    check('编辑者可以归档模板', templateArchived.status === 200 && templateArchived.payload.item.archived === true);
+    const hiddenArchived = await request('/api/templates?includeArchived=true', { cookie: viewer.session });
+    check('查看者不能读取归档模板正文', !hiddenArchived.payload.items.some(item => item.id === template.id));
+    await request(`/api/templates/${template.id}/archive`, { cookie: editor.session, method: 'POST', body: { archived: false } });
+    const templateRolled = await request(`/api/templates/${template.id}/rollback`, { cookie: editor.session, method: 'POST', body: { versionId: templateVersions.payload.items[0].id } });
+    check('编辑者可以回滚模板', templateRolled.status === 200);
     const testCase = await request('/api/test-cases', {
       cookie: editor.session, method: 'POST', body: { name: '权限测试', role: '测试', jd: 'JD', resume: '简历' }
     });

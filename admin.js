@@ -991,7 +991,14 @@
     const batchReview = $('#batchReview'); if (batchReview) batchReview.addEventListener('click', () => batch('submit-review'));
     const openTemplates = $('#openTemplates');
     if (openTemplates) openTemplates.addEventListener('click', async () => {
-      try { await loadTemplates(); openDrawer(`<div class="drawer-head"><div><h2>Prompt 模板</h2><p>模板只用于创建新的草稿，不会直接进入生产。</p></div><button class="close" data-act="close-drawer">×</button></div><div class="vlist">${state.templates.map(template => `<div class="vrow"><div class="vmeta"><div class="vver">${escapeHtml(template.name)}</div><div>${escapeHtml(template.desc || '')}</div><div class="prompt-meta">步骤 ${template.step || '扩展'} · 变量 ${(template.variables || []).join('、') || '无'}</div></div><button class="primary" style="padding:7px 10px" data-template-create="${escapeHtml(template.id)}">创建草稿</button></div>`).join('')}</div>`, true); }
+      try {
+        await loadTemplates();
+        const draw = () => `<div class="drawer-head"><div><h2>Prompt 模板</h2><p>模板只用于创建新的草稿，不会直接进入生产。</p></div><button class="close" data-act="close-drawer">×</button></div><div class="toolbar"><input id="templateSearch" placeholder="搜索模板名称、标签或内容" /><select id="templateCategory"><option value="">全部分类</option>${['通用', 'JD 分析', '证据校验', '匹配分析', '面试准备', '其他'].map(x => `<option>${x}</option>`).join('')}</select></div><div class="vlist">${state.templates.map(template => `<div class="vrow"><div class="vmeta"><div class="vver">${escapeHtml(template.name)} ${tag(template.version || 'v1.0')} ${template.archived ? tag('已归档', 'grey') : ''}</div><div>${escapeHtml(template.desc || '')}</div><div class="prompt-meta">${escapeHtml(template.category || '未分类')} · 步骤 ${template.step || '扩展'} · 标签 ${(template.tags || []).join('、') || '无'} · 变量 ${(template.variables || []).join('、') || '无'}</div></div><div class="actions"><button class="primary" style="padding:7px 10px" data-template-create="${escapeHtml(template.id)}" ${template.archived ? 'disabled' : ''}>创建草稿</button><button class="iconbtn" data-template-edit="${escapeHtml(template.id)}">编辑</button><button class="iconbtn" data-template-history="${escapeHtml(template.id)}">版本</button><button class="iconbtn" data-template-archive="${escapeHtml(template.id)}" data-archived="${template.archived ? 'false' : 'true'}">${template.archived ? '恢复' : '归档'}</button></div></div>`).join('')}</div>`;
+        openDrawer(draw(), true);
+        const reload = async () => { const q = $('#templateSearch')?.value || ''; const category = $('#templateCategory')?.value || ''; const data = await api(`/api/templates?q=${encodeURIComponent(q)}&category=${encodeURIComponent(category)}&includeArchived=true`); state.templates = data.items || []; openDrawer(draw(), true); bindTemplateFilters(); };
+        const bindTemplateFilters = () => { $('#templateSearch')?.addEventListener('input', () => { clearTimeout(bindTemplateFilters.timer); bindTemplateFilters.timer = setTimeout(reload, 250); }); $('#templateCategory')?.addEventListener('change', reload); };
+        bindTemplateFilters();
+      }
       catch (error) { toast(error.message, true); }
     });
     const reloadReleases = $('#reloadReleases');
@@ -1174,6 +1181,33 @@
     const templateButton = event.target.closest('[data-template-create]');
     if (templateButton) {
       try { const data = await api(`/api/templates/${encodeURIComponent(templateButton.dataset.templateCreate)}/create`, { method: 'POST', body: {} }); closeDrawer(); await refreshPrompts(); render(); toast(`已创建草稿：${data.prompt.name}`); } catch (error) { toast(error.message, true); }
+      return;
+    }
+    const templateArchive = event.target.closest('[data-template-archive]');
+    if (templateArchive) {
+      try { await api(`/api/templates/${encodeURIComponent(templateArchive.dataset.templateArchive)}/archive`, { method: 'POST', body: { archived: templateArchive.dataset.archived === 'true' } }); toast(templateArchive.dataset.archived === 'true' ? '模板已归档' : '模板已恢复'); $('#openTemplates')?.click(); } catch (error) { toast(error.message, true); }
+      return;
+    }
+    const templateEdit = event.target.closest('[data-template-edit]');
+    if (templateEdit) {
+      const template = state.templates.find(item => item.id === templateEdit.dataset.templateEdit);
+      if (!template) return;
+      openDrawer(`<div class="drawer-head"><div><h2>编辑模板</h2><p>修改只影响后续从模板创建的草稿。</p></div><button class="close" data-act="close-drawer">×</button></div><form id="templateEditForm"><div class="field"><label>模板名称</label><input id="te-name" value="${escapeHtml(template.name)}" required /></div><div class="field"><label>分类</label><select id="te-category">${['通用', 'JD 分析', '证据校验', '匹配分析', '面试准备', '其他'].map(x => `<option${template.category === x ? ' selected' : ''}>${x}</option>`).join('')}</select></div><div class="field"><label>标签（顿号或逗号分隔）</label><input id="te-tags" value="${escapeHtml((template.tags || []).join('、'))}" /></div><div class="field"><label>用途说明</label><textarea id="te-desc">${escapeHtml(template.desc || '')}</textarea></div><div class="field"><label>模板内容</label><textarea id="te-content" style="min-height:260px" required>${escapeHtml(template.content || '')}</textarea><span class="hint">允许变量：{{role}}、{{jd}}、{{resume}}、{{industry}}、{{company}}、{{stage}}、{{extra}}</span></div><div class="drawer-actions"><button type="button" class="secondary" data-act="close-drawer">取消</button><button class="primary" type="submit">保存模板</button></div></form>`, true);
+      $('#templateEditForm').addEventListener('submit', async formEvent => {
+        formEvent.preventDefault();
+        const tags = $('#te-tags').value.split(/[、,，]/).map(item => item.trim()).filter(Boolean);
+        try { await api(`/api/templates/${encodeURIComponent(template.id)}`, { method: 'PUT', body: { name: $('#te-name').value.trim(), category: $('#te-category').value, tags, desc: $('#te-desc').value.trim(), content: $('#te-content').value } }); closeDrawer(); toast('模板已保存'); } catch (error) { toast(error.message, true); }
+      });
+      return;
+    }
+    const templateHistory = event.target.closest('[data-template-history]');
+    if (templateHistory) {
+      try { const data = await api(`/api/templates/${encodeURIComponent(templateHistory.dataset.templateHistory)}/versions`); openDrawer(`<div class="drawer-head"><div><h2>模板版本</h2><p>回滚会生成新版本，历史不会删除。</p></div><button class="close" data-act="close-drawer">×</button></div><div class="vlist">${data.items.length ? data.items.map(item => `<div class="vrow"><div class="vmeta"><div class="vver">${escapeHtml(item.version)}</div><div>${fullTime(item.at)} · ${escapeHtml(item.actor || '')}</div></div><button class="iconbtn" data-template-rollback="${escapeHtml(templateHistory.dataset.templateHistory)}" data-version-id="${escapeHtml(item.id)}">恢复此版本</button></div>`).join('') : '<div class="empty">该模板尚无编辑版本</div>'}</div>`, true); } catch (error) { toast(error.message, true); }
+      return;
+    }
+    const templateRollback = event.target.closest('[data-template-rollback]');
+    if (templateRollback) {
+      try { await api(`/api/templates/${encodeURIComponent(templateRollback.dataset.templateRollback)}/rollback`, { method: 'POST', body: { versionId: templateRollback.dataset.versionId } }); closeDrawer(); toast('模板版本已恢复'); } catch (error) { toast(error.message, true); }
       return;
     }
     const target = event.target.closest('[data-act]');

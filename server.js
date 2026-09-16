@@ -286,7 +286,11 @@ const routes = {
     send(res, 200, { items, total: items.length });
   },
 
-  'GET /api/templates': (req, res) => send(res, 200, { items: store.listTemplates() }),
+  'GET /api/templates': (req, res, url) => send(res, 200, { items: store.listTemplates({ q: url.searchParams.get('q') || '', category: url.searchParams.get('category') || undefined, includeArchived: url.searchParams.get('includeArchived') === 'true' && auth.hasRole(req.auth, 'editor') }), categories: ['通用', 'JD 分析', '证据校验', '匹配分析', '面试准备', '其他'] }),
+  'PUT /api/templates/:id': async (req, res, url, params) => { const body = await readBody(req, ADMIN_LIMIT); const item = store.updateTemplate(params.id, body, req.auth.username); if (!item) return send(res, 404, { error: 'Prompt 模板不存在', code: 'TEMPLATE_NOT_FOUND' }); send(res, 200, { item }); },
+  'GET /api/templates/:id/versions': (req, res, url, params) => send(res, 200, { items: store.listTemplateVersions(params.id) }),
+  'POST /api/templates/:id/rollback': async (req, res, url, params) => { const body = await readBody(req, ADMIN_LIMIT); const item = store.rollbackTemplate(params.id, body.versionId, req.auth.username); if (!item) return send(res, 404, { error: '模板或版本不存在', code: 'TEMPLATE_VERSION_NOT_FOUND' }); send(res, 200, { item }); },
+  'POST /api/templates/:id/archive': async (req, res, url, params) => { const body = await readBody(req, ADMIN_LIMIT); const item = store.archiveTemplate(params.id, body.archived !== false, req.auth.username); if (!item) return send(res, 404, { error: 'Prompt 模板不存在', code: 'TEMPLATE_NOT_FOUND' }); send(res, 200, { item }); },
   'POST /api/templates/:id/create': async (req, res, url, params) => { const body = await readBody(req, ADMIN_LIMIT); send(res, 201, { prompt: store.createPromptFromTemplate(params.id, body, req.auth.username) }); },
   'POST /api/prompts/batch': async (req, res) => { const body = await readBody(req, ADMIN_LIMIT); send(res, 200, store.batchPromptAction(body.ids, body.action, body, req.auth.username)); },
 
@@ -469,6 +473,9 @@ function requiredRole(method, pathname) {
   if (method === 'POST' && pathname === '/api/prompts') return 'editor';
   if (method === 'POST' && pathname === '/api/prompts/batch') return 'editor';
   if (method === 'POST' && /^\/api\/templates\/[^/]+\/create$/.test(pathname)) return 'editor';
+  if (method === 'PUT' && /^\/api\/templates\/[^/]+$/.test(pathname)) return 'editor';
+  if (method === 'POST' && /^\/api\/templates\/[^/]+\/archive$/.test(pathname)) return 'editor';
+  if (method === 'POST' && /^\/api\/templates\/[^/]+\/rollback$/.test(pathname)) return 'editor';
   if (method === 'PUT' && /^\/api\/prompts\/[^/]+$/.test(pathname)) return 'editor';
   if (method === 'POST' && /^\/api\/prompts\/[^/]+\/(toggle|rollback|submit-review)$/.test(pathname)) return 'editor';
   if (method === 'POST' && /^\/api\/prompts\/[^/]+\/test$/.test(pathname)) return 'editor';

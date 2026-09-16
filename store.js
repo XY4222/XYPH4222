@@ -29,7 +29,8 @@ const FILES = {
   regressions: path.join(DATA_DIR, 'regressions.jsonl'),
   feedback: path.join(DATA_DIR, 'feedback.json'),
   rules: path.join(DATA_DIR, 'rules.json'),
-  templates: path.join(DATA_DIR, 'templates.json')
+  templates: path.join(DATA_DIR, 'templates.json'),
+  templateVersions: path.join(DATA_DIR, 'template-versions.json')
 };
 
 const LOG_LIMIT = 5000;
@@ -91,9 +92,24 @@ function ensureData() {
     { id: 'rule-review-placeholders', name: '检查未确认占位符', type: 'forbidden_pattern', pattern: '【待补充|【待确认', severity: 'medium', enabled: true, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
   ]);
   if (!fs.existsSync(FILES.templates)) writeJson(FILES.templates, [
-    { id: 'tpl-evidence-safe', name: '证据边界检查', type: 'task', stepKey: 'diagnosis', step: 3, desc: '强调事实边界、责任范围和待确认信息', content: '围绕 {{role}} 岗位，检查简历中的职责、结果和数字是否有 {{resume}} 中的事实依据。对无法核验的内容标记【待确认】，不得补写。', variables: ['role', 'resume'], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
-    { id: 'tpl-jd-match', name: 'JD 证据映射', type: 'task', stepKey: 'match', step: 4, desc: '将岗位要求映射到候选人证据', content: '将 {{jd}} 的关键要求逐项映射到 {{resume}} 的证据，区分强、中、弱、无，并指出需要补充的事实。', variables: ['jd', 'resume'], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
+    { id: 'tpl-evidence-safe', name: '证据边界检查', type: 'task', stepKey: 'diagnosis', step: 3, desc: '强调事实边界、责任范围和待确认信息', content: '围绕 {{role}} 岗位，检查简历中的职责、结果和数字是否有 {{resume}} 中的事实依据。对无法核验的内容标记【待确认】，不得补写。', variables: ['role', 'resume'], version: 'v1.0', category: '证据校验', tags: ['事实边界'], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+    { id: 'tpl-jd-match', name: 'JD 证据映射', type: 'task', stepKey: 'match', step: 4, desc: '将岗位要求映射到候选人证据', content: '将 {{jd}} 的关键要求逐项映射到 {{resume}} 的证据，区分强、中、弱、无，并指出需要补充的事实。', variables: ['jd', 'resume'], version: 'v1.0', category: '匹配分析', tags: ['JD'], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
   ]);
+  if (!fs.existsSync(FILES.templateVersions)) writeJson(FILES.templateVersions, []);
+  const templates = readJson(FILES.templates, []);
+  const templateVersions = readJson(FILES.templateVersions, []);
+  let templatesChanged = false; let templateVersionsChanged = false;
+  for (const template of templates) {
+    if (!template.version) { template.version = 'v1.0'; templatesChanged = true; }
+    if (!template.category) { template.category = '其他'; templatesChanged = true; }
+    if (!Array.isArray(template.tags)) { template.tags = []; templatesChanged = true; }
+    if (!templateVersions.some(item => item.templateId === template.id)) {
+      templateVersions.push({ id: `tv-seed-${template.id}`, templateId: template.id, version: template.version, action: 'seed', actor: '系统初始化', at: template.createdAt || new Date().toISOString(), snapshot: { name: template.name, desc: template.desc, content: template.content, category: template.category, tags: template.tags, variables: template.variables || [] } });
+      templateVersionsChanged = true;
+    }
+  }
+  if (templatesChanged) writeJson(FILES.templates, templates);
+  if (templateVersionsChanged) writeJson(FILES.templateVersions, templateVersions);
 
   // 兼容旧数据：升级前的每条记录都等同于已经在线生效的生产版本。
   const existing = readJson(FILES.prompts, []);
@@ -156,7 +172,71 @@ function validatePromptContent(content) {
   return [...new Set(names)];
 }
 
-function listTemplates() { return readJson(FILES.templates, []).sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt)); }
+function listTemplates({ q = '', category, includeArchived = false } = {}) {
+  const needle = String(q).trim().toLowerCase();
+  return readJson(FILES.templates, [])
+    .filter(item => includeArchived || !item.archived)
+    .filter(item => !category || item.category === category)
+    .filter(item => !needle || [item.name, item.desc, item.content, item.category, ...(item.tags || [])].join(' ').toLowerCase().includes(needle))
+    .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+}
+
+function updateTemplate(id, input, actor) {
+  const templates = readJson(FILES.templates, []);
+  const template = templates.find(item => item.id === id);
+  if (!template) return null;
+  const nextContent = input.content === undefined ? template.content : clip(input.content);
+  if (!String(nextContent || '').trim()) throw Object.assign(new Error('模板内容不能为空'), { statusCode: 400, code: 'EMPTY_TEMPLATE_CONTENT' });
+  const variables = validatePromptContent(nextContent);
+  const allowedCategories = new Set(['通用', 'JD 分析', '证据校验', '匹配分析', '面试准备', '其他']);
+  if (input.name !== undefined) template.name = clip(input.name, 100).trim() || template.name;
+  if (input.desc !== undefined) template.desc = clip(input.desc, 300).trim();
+  if (input.content !== undefined) template.content = nextContent;
+  if (input.category !== undefined) template.category = allowedCategories.has(input.category) ? input.category : '其他';
+  if (input.tags !== undefined) template.tags = Array.isArray(input.tags) ? input.tags.map(tag => clip(tag, 40).trim()).filter(Boolean).slice(0, 20) : [];
+  template.variables = variables;
+  template.version = bumpVersion(template.version || 'v1.0');
+  template.updatedAt = new Date().toISOString();
+  template.updatedBy = actor;
+  pushTemplateVersion(template, actor, 'update');
+  pushAuditEvent('template_update', actor, `模板：${template.name}`, `更新 ${template.id}`);
+  writeJson(FILES.templates, templates);
+  return template;
+}
+
+function pushTemplateVersion(template, actor, action) {
+  const versions = readJson(FILES.templateVersions, []);
+  versions.push({ id: `tv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`, templateId: template.id, version: template.version || 'v1.0', action, actor, at: new Date().toISOString(), snapshot: { name: template.name, desc: template.desc, content: template.content, category: template.category || '其他', tags: template.tags || [], variables: template.variables || [] } });
+  writeJson(FILES.templateVersions, versions);
+}
+
+function listTemplateVersions(id) { return readJson(FILES.templateVersions, []).filter(item => item.templateId === id).sort((a, b) => new Date(b.at) - new Date(a.at)); }
+
+function rollbackTemplate(id, versionId, actor) {
+  const templates = readJson(FILES.templates, []);
+  const template = templates.find(item => item.id === id);
+  const target = listTemplateVersions(id).find(item => item.id === versionId);
+  if (!template || !target) return null;
+  Object.assign(template, target.snapshot);
+  template.version = bumpVersion(template.version || 'v1.0');
+  template.updatedAt = new Date().toISOString(); template.updatedBy = actor;
+  pushTemplateVersion(template, actor, 'rollback');
+  pushAuditEvent('template_rollback', actor, `模板：${template.name}`, `恢复 ${target.version} 为 ${template.version}`);
+  writeJson(FILES.templates, templates);
+  return template;
+}
+
+function archiveTemplate(id, archived, actor) {
+  const templates = readJson(FILES.templates, []);
+  const template = templates.find(item => item.id === id);
+  if (!template) return null;
+  template.archived = archived !== false;
+  template.archivedAt = template.archived ? new Date().toISOString() : null;
+  template.updatedAt = new Date().toISOString(); template.updatedBy = actor;
+  pushAuditEvent(template.archived ? 'template_archive' : 'template_restore', actor, `模板：${template.name}`, `${template.archived ? '归档' : '恢复'} ${template.id}`);
+  writeJson(FILES.templates, templates);
+  return template;
+}
 
 function createPromptFromTemplate(templateId, input, actor) {
   const template = listTemplates().find(item => item.id === templateId);
@@ -458,7 +538,8 @@ const ACTION_LABEL = {
   status: '修改状态', enable: '启用', disable: '停用', rollback: '恢复为草稿', delete: '删除',
   submit_review: '提交审核', reject_review: '审核驳回', publish: '发布生产', production_rollback: '生产回滚',
   test_case_create: '保存测试案例', test_case_delete: '删除测试案例', feedback_update: '更新质量反馈',
-  auth_login_failed: '登录失败', auth_login_success: '登录成功', auth_logout: '退出登录'
+  auth_login_failed: '登录失败', auth_login_success: '登录成功', auth_logout: '退出登录',
+  template_update: '编辑模板', template_archive: '归档模板', template_restore: '恢复模板', template_rollback: '回滚模板'
 };
 
 function pushAuditEvent(action, actor, subject, note) {
@@ -1041,7 +1122,7 @@ module.exports = {
   regressionSuiteKey, appendRegression, listRegressions,
   findLog, listFeedback, saveFeedback, updateFeedback, feedbackStats,
   listRules, createRule, updateRule, removeRule, scanRisk,
-  listTemplates, createPromptFromTemplate, batchPromptAction,
+  listTemplates, updateTemplate, archiveTemplate, listTemplateVersions, rollbackTemplate, createPromptFromTemplate, batchPromptAction,
   dependencyView,
   validatePromptContent, replacePromptVariables, PROMPT_VARIABLES,
   overview, costOf, bumpVersion
