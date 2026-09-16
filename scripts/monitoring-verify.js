@@ -31,6 +31,8 @@ try {
   check('失败调用也关联实际 Prompt 版本', stats.byPromptVersion.some(item => item.prompt === '简历诊断' && item.version === 'v1.0' && item.failed === 1 && item.schemaErrors === 1));
   check('异常阈值告警按区间统计触发', stats.alerts.some(item => item.scope === 'overall' && item.metric === 'failureRate') && stats.alerts.some(item => item.scope === '简历诊断@v1.0' && item.metric === 'schemaErrorRate'));
   check('告警包含安全的日志钻取筛选', stats.alerts.some(item => item.scope === '简历诊断@v1.0' && item.drilldown?.prompt === '简历诊断' && item.drilldown.ok === 'false' && item.drilldown.days === 7));
+  const diagnosisTrend = stats.promptVersionTrends.find(item => item.prompt === '简历诊断' && item.version === 'v1.0');
+  check('Prompt 版本趋势按天聚合', diagnosisTrend?.daily.length === 1 && diagnosisTrend.daily[0].calls === 2 && diagnosisTrend.daily[0].failureRate === 50 && diagnosisTrend.daily[0].retryRate === 100);
   check('Schema 告警按请求计数而非字段计数', stats.alerts.find(item => item.scope === 'overall' && item.metric === 'schemaErrorRate')?.rate === 25);
   const alert = stats.alerts.find(item => item.scope === 'overall' && item.metric === 'failureRate');
   const ack = store.acknowledgeAlert(alert.id, '监控管理员');

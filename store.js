@@ -790,6 +790,7 @@ function logStats(days = 7, filters = {}) {
   const byModel = {};
   const byPrompt = {};
   const byPromptVersion = {};
+  const promptVersionDaily = {};
   for (const r of rows) {
     const model = r.modelReturned || r.model || 'unknown';
     byModel[model] = byModel[model] || { model, total: 0, failed: 0, latencySum: 0, latencyCount: 0, tokens: 0, cost: 0 };
@@ -817,6 +818,14 @@ function logStats(days = 7, filters = {}) {
       if (Number(r.attempts || 1) > 1) bucket.retries += 1;
       if (r.ok) { bucket.latencySum += Number(r.latencyMs || 0); bucket.latencyCount += 1; }
       bucket.cost += perPromptVersionCost;
+      promptVersionDaily[key] = promptVersionDaily[key] || {};
+      const day = String(r.at).slice(0, 10);
+      const dailyBucket = promptVersionDaily[key][day] || { day, calls: 0, failed: 0, schemaErrors: 0, retries: 0 };
+      dailyBucket.calls += 1;
+      if (!r.ok) dailyBucket.failed += 1;
+      if ((r.validationErrors || []).length) dailyBucket.schemaErrors += 1;
+      if (Number(r.attempts || 1) > 1) dailyBucket.retries += 1;
+      promptVersionDaily[key][day] = dailyBucket;
     }
     if (r.ok) continue;
     for (const field of r.validationErrors || []) schemaFields[field] = (schemaFields[field] || 0) + 1;
@@ -852,6 +861,10 @@ function logStats(days = 7, filters = {}) {
     addAlert(label, 'retryRate', retryRate, Number(settings.alertRetryRate), item.calls, `${label} 重试率 ${retryRate.toFixed(1)}% 超过阈值`, { prompt: item.prompt, version: item.version });
   }
   const alertHistory = syncAlertStates(alerts, context, total >= alertMinCalls);
+  const promptVersionTrends = Object.entries(promptVersionDaily).map(([key, daysByDate]) => {
+    const [prompt, ...versionParts] = key.split('@');
+    return { prompt, version: versionParts.join('@'), daily: Object.values(daysByDate).sort((a, b) => a.day.localeCompare(b.day)).map(item => ({ ...item, failureRate: Number((item.failed / item.calls * 100).toFixed(1)), schemaErrorRate: Number((item.schemaErrors / item.calls * 100).toFixed(1)), retryRate: Number((item.retries / item.calls * 100).toFixed(1)) })) };
+  });
   return {
     total, failed, successRate: total ? Number(((total - failed) / total * 100).toFixed(1)) : 100,
     avgLatency: latencies.length ? Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length) : 0,
@@ -867,6 +880,7 @@ function logStats(days = 7, filters = {}) {
     byModel: Object.values(byModel).map(item => ({ ...item, successRate: item.total ? Number(((item.total - item.failed) / item.total * 100).toFixed(1)) : 100, avgLatency: item.latencyCount ? Math.round(item.latencySum / item.latencyCount) : 0, cost: Number(item.cost.toFixed(4)) })).sort((a, b) => b.total - a.total),
     byPrompt: Object.values(byPrompt).sort((a, b) => b.calls - a.calls),
     byPromptVersion: Object.values(byPromptVersion).map(item => ({ ...item, failureRate: item.calls ? Number((item.failed / item.calls * 100).toFixed(1)) : 0, retryRate: item.calls ? Number((item.retries / item.calls * 100).toFixed(1)) : 0, avgLatency: item.latencyCount ? Math.round(item.latencySum / item.latencyCount) : 0, cost: Number(item.cost.toFixed(4)) })).sort((a, b) => b.calls - a.calls),
+    promptVersionTrends,
     slowest: rows.filter(r => r.ok).sort((a, b) => Number(b.latencyMs || 0) - Number(a.latencyMs || 0)).slice(0, 10).map(r => ({ id: r.id, at: r.at, latencyMs: r.latencyMs, model: r.modelReturned || r.model, role: r.role, prompts: r.prompts || [], inputChars: r.inputChars, attempts: r.attempts })),
     filters: { models, prompts },
     alerts: alerts.sort((a, b) => b.rate - a.rate),

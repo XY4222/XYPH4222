@@ -536,6 +536,22 @@
       <div class="legend"><span><i style="background:#93b4f5"></i>总调用</span><span><i style="background:#d4717c"></i>失败</span></div>`;
   }
 
+  function promptTrendChart(trends, alerts) {
+    const keys = [...new Set((alerts || []).map(item => item.scope).filter(scope => scope && scope.includes('@')))];
+    const selected = keys.map(key => trends.find(item => `${item.prompt}@${item.version}` === key)).filter(Boolean).slice(0, 6);
+    if (!selected.length) return '<div class="empty">当前区间暂无 Prompt 版本趋势</div>';
+    const width = 720; const height = 150; const pad = { top: 14, right: 12, bottom: 26, left: 38 }; const innerW = width - pad.left - pad.right; const innerH = height - pad.top - pad.bottom;
+    const renderLine = (daily, field, color) => {
+      const max = Math.max(100, ...daily.map(item => Number(item[field] || 0)));
+      const points = daily.map((item, index) => `${(pad.left + (daily.length === 1 ? innerW / 2 : innerW * index / (daily.length - 1))).toFixed(1)},${(pad.top + innerH - Number(item[field] || 0) / max * innerH).toFixed(1)}`).join(' ');
+      return `<polyline points="${points}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"></polyline>`;
+    };
+    return selected.map(item => {
+      const daily = item.daily; const labels = daily.filter((_, index) => daily.length <= 8 || index % Math.ceil(daily.length / 8) === 0).map(day => escapeHtml(day.day.slice(5))).join(' · ');
+      return `<div class="trend-card"><div class="panel-head"><div><h3>${escapeHtml(item.prompt)} · ${escapeHtml(item.version)}</h3><p>${labels || '暂无日期'} · 每日比例（%）</p></div></div><svg class="chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="${escapeHtml(item.prompt)} ${escapeHtml(item.version)} 告警趋势"><line x1="${pad.left}" y1="${pad.top + innerH}" x2="${width - pad.right}" y2="${pad.top + innerH}" stroke="#eef1f6"></line>${renderLine(daily, 'failureRate', '#d4717c')}${renderLine(daily, 'schemaErrorRate', '#e0a34a')}${renderLine(daily, 'retryRate', '#6b8ed6')}</svg><div class="legend"><span><i style="background:#d4717c"></i>失败率</span><span><i style="background:#e0a34a"></i>Schema 错误率</span><span><i style="background:#6b8ed6"></i>重试率</span></div></div>`;
+    }).join('');
+  }
+
   function viewLogs() {
     const s = state.logStats;
     if (!s) return `<div class="headline"><div><h1>运行日志</h1><p>每次分析的模型、耗时、token、成本与错误分布。</p></div></div>${loading()}`;
@@ -605,6 +621,7 @@
       </section>
       ${alertRows || '<div class="banner good show">当前区间没有触发异常阈值告警</div>'}
       ${alertHistoryRows ? `<section class="panel"><div class="panel-head"><div><h2>告警生命周期</h2><p>同一范围与指标自动归并；低于阈值后标记为已恢复</p></div></div><table class="table"><thead><tr><th>范围</th><th>指标</th><th>状态</th><th>最近比例</th><th>状态时间</th><th>确认人</th></tr></thead><tbody>${alertHistoryRows}</tbody></table></section>` : ''}
+      <section class="panel"><div class="panel-head"><div><h2>Prompt 版本趋势</h2><p>仅展示当前告警关联版本；按天计算失败率、Schema 错误率和重试率</p></div></div><div class="trend-grid">${promptTrendChart(s.promptVersionTrends || [], s.alerts || [])}</div></section>
       <div class="grid2">
         <section class="panel">
           <div class="panel-head"><div><h2>每日调用量</h2><p>失败调用叠加显示</p></div></div>
