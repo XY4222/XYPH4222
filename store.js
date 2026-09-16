@@ -965,6 +965,23 @@ function overview() {
   };
 }
 
+function dependencyView() {
+  const prompts = getPrompts();
+  const rules = listRules().filter(rule => rule.enabled);
+  const steps = Array.from({ length: 8 }, (_, index) => {
+    const step = index + 1;
+    const items = prompts.filter(prompt => Number(prompt.step) === step);
+    return {
+      step, prompts: items.map(prompt => ({ id: prompt.id, name: prompt.name, enabled: !!prompt.enabled, releaseStatus: prompt.releaseStatus, publishedVersion: prompt.publishedVersion, version: prompt.version, variables: prompt.variables || [], regressionCases: listTestCases(prompt.id).length, latestRegression: listRegressions(prompt.id, 1)[0]?.passed ?? null })),
+      workspaceCount: items.filter(prompt => prompt.enabled).length,
+      productionCount: items.filter(prompt => prompt.publishedSnapshot?.enabled).length,
+      covered: items.some(prompt => prompt.publishedSnapshot?.enabled),
+      hasDraft: items.some(prompt => prompt.releaseStatus !== 'published')
+    };
+  });
+  return { steps, extensionPrompts: prompts.filter(prompt => prompt.step == null).map(prompt => ({ id: prompt.id, name: prompt.name, enabled: !!prompt.enabled, releaseStatus: prompt.releaseStatus })), enabledRules: rules.map(rule => ({ id: rule.id, name: rule.name, severity: rule.severity })) };
+}
+
 ensureData();
 pruneLogs();
 
@@ -978,6 +995,7 @@ module.exports = {
   regressionSuiteKey, appendRegression, listRegressions,
   findLog, listFeedback, saveFeedback, updateFeedback, feedbackStats,
   listRules, createRule, updateRule, removeRule, scanRisk,
+  dependencyView,
   validatePromptContent, replacePromptVariables, PROMPT_VARIABLES,
   overview, costOf, bumpVersion
 };

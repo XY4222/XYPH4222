@@ -26,6 +26,7 @@
     feedback: [],
     feedbackStats: null,
     rules: [],
+    dependencies: null,
     testResult: null,
     testForm: { promptId: '', caseId: '', name: '', role: '', jd: '', resume: '', extra: '', minScore: '0', maxScoreDrop: '5', requiredTerms: '' },
     currentPrompt: null,
@@ -214,7 +215,7 @@
 
   /* ---------- 路由 ---------- */
 
-  const ROUTE_TITLE = { prompts: 'Prompt 总览', releases: '发布中心', tests: 'Prompt 测试台', changes: '变更记录', logs: '运行日志', feedback: '质量反馈', rules: '风险规则', settings: '项目设置' };
+  const ROUTE_TITLE = { prompts: 'Prompt 总览', releases: '发布中心', tests: 'Prompt 测试台', changes: '变更记录', logs: '运行日志', feedback: '质量反馈', rules: '风险规则', dependencies: '流程依赖', settings: '项目设置' };
 
   function setNav(route) {
     $('#crumb').textContent = ROUTE_TITLE[route] || route;
@@ -231,6 +232,7 @@
       else if (route === 'logs') await loadLogs();
       else if (route === 'feedback') await loadFeedback();
       else if (route === 'rules') await loadRules();
+      else if (route === 'dependencies') await loadDependencies();
       else if (route === 'settings') await loadSettings();
       else if (route === 'tests') await loadTests();
       else if ((route === 'prompts' || route === 'releases') && !state.overview) await loadPrompts();
@@ -246,6 +248,7 @@
     else if (state.route === 'logs') page.innerHTML = viewLogs();
     else if (state.route === 'feedback') page.innerHTML = viewFeedback();
     else if (state.route === 'rules') page.innerHTML = viewRules();
+    else if (state.route === 'dependencies') page.innerHTML = viewDependencies();
     else page.innerHTML = viewSettings();
     bindView();
     // viewPrompts() 只铺出空表格骨架，行要靠 renderRows 填。切走再切回来时
@@ -268,6 +271,14 @@
   function viewRules() {
     const rows = state.rules.map(rule => `<tr><td>${escapeHtml(rule.name)}</td><td>${tag(rule.type === 'forbidden_pattern' ? '禁止匹配' : '必须匹配', rule.type === 'forbidden_pattern' ? 'red' : 'blue')}</td><td><code>${escapeHtml(rule.pattern)}</code></td><td>${tag(rule.severity, rule.severity === 'critical' || rule.severity === 'high' ? 'red' : 'amber')}</td><td>${rule.enabled ? tag('启用', 'green') : tag('停用')}</td><td>${can('editor') ? `<button class="iconbtn" data-rule-toggle="${escapeHtml(rule.id)}" data-enabled="${rule.enabled ? 'false' : 'true'}">${rule.enabled ? '停用' : '启用'}</button>` : ''}${can('admin') ? `<button class="iconbtn danger-text" data-rule-delete="${escapeHtml(rule.id)}">删除</button>` : ''}</td></tr>`).join('');
     return `<div class="headline"><div><h1>风险规则</h1><p>服务端扫描模型输出，命中结果会回传给调用方并写入运行指标。</p></div><button class="secondary" id="reloadRules">刷新</button></div><section class="panel"><div class="panel-head"><div><h2>规则列表</h2><p>规则变更进入审计记录；停用不删除历史</p></div></div>${rows ? `<table class="table"><thead><tr><th>规则</th><th>类型</th><th>模式</th><th>级别</th><th>状态</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">暂无风险规则</div>'}</section>`;
+  }
+
+  function viewDependencies() {
+    const data = state.dependencies;
+    if (!data) return loading();
+    const rows = data.steps.map(step => `<tr><td><strong>步骤 ${step.step}</strong></td><td>${step.covered ? tag('生产已覆盖', 'green') : tag('生产缺失', 'red')}</td><td>${step.workspaceCount} / ${step.productionCount}</td><td>${step.hasDraft ? tag('有草稿', 'amber') : tag('一致', 'green')}</td><td>${step.prompts.length ? step.prompts.map(prompt => `<div class="prompt-name">${escapeHtml(prompt.name)} ${prompt.variables.length ? tag(`变量 ${prompt.variables.length}`, 'blue') : ''} ${prompt.regressionCases ? tag(prompt.latestRegression ? '门禁通过' : '门禁未通过', prompt.latestRegression ? 'green' : 'red') : ''}</div>`).join('') : '<span class="prompt-meta">未配置</span>'}</td></tr>`).join('');
+    const extensions = data.extensionPrompts.length ? data.extensionPrompts.map(prompt => `<div class="case-row"><div class="case-main"><div class="prompt-name">${escapeHtml(prompt.name)}</div><div class="prompt-meta">${prompt.enabled ? '启用' : '停用'} · ${escapeHtml(prompt.releaseStatus)}</div></div></div>`).join('') : '<div class="empty">暂无扩展 Prompt</div>';
+    return `<div class="headline"><div><h1>流程依赖</h1><p>从服务端数据查看 8 步流程的生产覆盖、草稿漂移、变量和回归门禁状态。</p></div><button class="secondary" id="reloadDependencies">刷新</button></div><section class="panel"><div class="panel-head"><div><h2>步骤覆盖矩阵</h2><p>工作区数量 / 生产数量；生产缺失需要先发布对应 Prompt</p></div></div><table class="table"><thead><tr><th>步骤</th><th>生产覆盖</th><th>工作区 / 生产</th><th>一致性</th><th>Prompt 与依赖</th></tr></thead><tbody>${rows}</tbody></table></section><div class="grid2"><section class="panel"><div class="panel-head"><div><h2>扩展 Prompt</h2><p>不属于 8 个固定步骤的额外注入</p></div></div><div class="case-list">${extensions}</div></section><section class="panel"><div class="panel-head"><div><h2>当前启用风险规则</h2><p>输出扫描会影响分析结果的 riskCheck</p></div></div><div class="case-list">${data.enabledRules.length ? data.enabledRules.map(rule => `<div class="case-row"><div class="case-main"><div class="prompt-name">${escapeHtml(rule.name)}</div><div class="prompt-meta">${escapeHtml(rule.severity)} · ${escapeHtml(rule.id)}</div></div></div>`).join('') : '<div class="empty">暂无启用规则</div>'}</div></section></div>`;
   }
 
   function captureTestForm() {
@@ -912,6 +923,11 @@
     catch (error) { showConnError(`风险规则加载失败：${error.message}`); }
   }
 
+  async function loadDependencies() {
+    try { const data = await api('/api/dependencies'); state.dependencies = data; clearConnError(); render(); }
+    catch (error) { showConnError(`流程依赖加载失败：${error.message}`); }
+  }
+
   async function loadSettings() {
     try {
       const data = await api('/api/settings');
@@ -1110,6 +1126,8 @@
       try { await api(`/api/rules/${encodeURIComponent(button.dataset.ruleDelete)}`, { method: 'DELETE' }); toast('风险规则已删除'); await loadRules(); }
       catch (error) { toast(error.message, true); }
     }));
+    const reloadDependencies = $('#reloadDependencies');
+    if (reloadDependencies) reloadDependencies.addEventListener('click', loadDependencies);
 
     // 项目设置
     const saveSettings = $('#saveSettings');

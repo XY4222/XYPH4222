@@ -249,6 +249,7 @@ const routes = {
   'GET /api/health': (req, res) => send(res, 200, { ok: true, at: new Date().toISOString() }),
 
   'GET /api/overview': (req, res) => send(res, 200, store.overview()),
+  'GET /api/dependencies': (req, res) => send(res, 200, store.dependencyView()),
 
   'GET /api/prompts': (req, res, url) => {
     // 搜索在服务端完成：列表不回传正文，但关键词仍需匹配到正文
