@@ -18,6 +18,7 @@ async function main() {
     check('非法评价返回 400', invalid.status === 400 && invalid.body.code === 'INVALID_FEEDBACK_RATING');
     const saved = await call('/api/feedback', 'POST', { logId: result.body.runId, rating: 'bad', tags: ['事实错误', '结构问题'], comment: '需要补充证据', owner: 'editor' });
     check('可以保存质量反馈', saved.status === 201 && saved.body.item.rating === 'bad' && saved.body.item.prompts);
+    check('质量反馈绑定实际 Prompt 版本', saved.body.item.promptVersions?.length > 0 && saved.body.item.promptVersions.every(item => item.name && item.version));
     const list = await call('/api/feedback');
     check('反馈列表不含 JD 或简历原文', list.body.items.length === 1 && !JSON.stringify(list.body.items).includes('RESUME') && !JSON.stringify(list.body.items).includes('"jd"'));
     check('反馈统计正确', list.body.stats.bad === 1 && list.body.stats.open === 1 && list.body.stats.byTag.some(item => item.tag === '事实错误'));

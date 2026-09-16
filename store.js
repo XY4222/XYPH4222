@@ -823,6 +823,7 @@ function saveFeedback(input, actor) {
     model: log.modelReturned || log.model || null,
     role: log.role || null,
     prompts: log.prompts || [],
+    promptVersions: (log.promptVersions || []).map(item => ({ name: clip(item.name, 80), version: clip(item.version, 40) })),
     runAt: log.at,
     updatedAt: now,
     updatedBy: actor
