@@ -161,13 +161,19 @@ async function main() {
     /* ---------- 失败也要进日志 ---------- */
     group('6. 失败也落日志');
     const bad = await postJson('/api/analyze', {});
-    check('缺字段返回 400', bad.status === 400, (await json(bad)).code);
+    const badBody = await json(bad);
+    check('缺字段返回 400', bad.status === 400, badBody.code);
+    check('缺字段返回统一降级状态', badBody.degradation?.state === 'invalid_request' && badBody.degradation.retryable === false);
+    check('缺字段失败可凭 runId 追踪', typeof badBody.runId === 'string' && badBody.runId.length > 5);
 
     const saved = await json(await get('/api/settings'));
     await postJson('/api/settings', { ...saved.settings, analyzeEnabled: false }, 'PUT');
     // 必须带齐 role/jd/resume，否则先撞上字段校验拿 400，验不到总开关这条路径。
     const disabled = await postJson('/api/analyze', { role: 'x', jd: 'y', resume: 'z' });
-    check('关闭总开关返回 503', disabled.status === 503, (await json(disabled)).code);
+    const disabledBody = await json(disabled);
+    check('关闭总开关返回 503', disabled.status === 503, disabledBody.code);
+    check('暂停状态不可盲目重试', disabledBody.degradation?.state === 'paused' && disabledBody.degradation.retryable === false);
+    check('暂停失败可凭 runId 追踪', typeof disabledBody.runId === 'string' && disabledBody.runId.length > 5);
     await postJson('/api/settings', saved.settings, 'PUT');
 
     const stats = await json(await get('/api/logs/stats?days=7'));

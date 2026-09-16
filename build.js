@@ -99,17 +99,44 @@ function parseModelJson(content) {
   return parsed;
 }
 
+function degradationFor(code, retryAfter) {
+  const table = {
+    RATE_LIMIT: { state: 'rate_limited', retryable: true, message: '分析请求较多，请稍后重试', defaultWait: 30 },
+    UPSTREAM_TIMEOUT: { state: 'timeout', retryable: true, message: '模型响应超时，可重试', defaultWait: 3 },
+    MODEL_UNAVAILABLE: { state: 'model_unavailable', retryable: true, message: '模型服务暂时不可用，可稍后重试', defaultWait: 10 },
+    MISSING_API_KEY: { state: 'configuration_error', retryable: false, message: '分析服务尚未完成配置' },
+    MODEL_AUTH_ERROR: { state: 'configuration_error', retryable: false, message: '模型服务鉴权失败，请联系管理员' },
+    MODEL_REQUEST_REJECTED: { state: 'request_rejected', retryable: false, message: '模型服务拒绝了本次请求，请联系管理员检查配置' },
+    EMPTY_MODEL_OUTPUT: { state: 'invalid_response', retryable: true, message: '模型未返回有效结果，可重试' },
+    INVALID_MODEL_JSON: { state: 'invalid_response', retryable: true, message: '模型返回内容不完整，可重试' },
+    BAD_REQUEST: { state: 'invalid_request', retryable: false, message: '请补全目标岗位、JD 和原始简历' }
+  };
+  const { defaultWait = 0, ...meta } = table[code] || { state: 'failed', retryable: true, message: '本次分析未完成', defaultWait: 3 };
+  const wait = Math.max(0, Math.min(300, Number(retryAfter) || 0));
+  return { ...meta, retryAfterSeconds: wait || defaultWait };
+}
+
+function upstreamCode(status) {
+  if (status === 429) return 'RATE_LIMIT';
+  if (status === 408) return 'UPSTREAM_TIMEOUT';
+  if (status === 401 || status === 403) return 'MODEL_AUTH_ERROR';
+  if (status === 404 || status >= 500) return 'MODEL_UNAVAILABLE';
+  return 'MODEL_REQUEST_REJECTED';
+}
+
 async function handleAnalyze(request, env) {
-  if (!env.DEEPSEEK_API_KEY) return json({ error: '服务端尚未配置 DEEPSEEK_API_KEY', code: 'MISSING_API_KEY' }, 503);
+  if (!env.DEEPSEEK_API_KEY) return json({ error: '服务端尚未配置 DEEPSEEK_API_KEY', code: 'MISSING_API_KEY', degradation: degradationFor('MISSING_API_KEY') }, 503);
   const input = await request.json();
-  if (!input.role || !input.jd || !input.resume) return json({ error: '缺少目标岗位、JD 或原始简历', code: 'BAD_REQUEST' }, 400);
+  if (!input.role || !input.jd || !input.resume) return json({ error: '缺少目标岗位、JD 或原始简历', code: 'BAD_REQUEST', degradation: degradationFor('BAD_REQUEST') }, 400);
 
   const model = env.DEEPSEEK_MODEL || PROMPT_META.settings.model || 'deepseek-v4-flash';
   const retries = Number.isFinite(PROMPT_META.settings.retries) ? PROMPT_META.settings.retries : 2;
   const userPrompt = buildUserPrompt(input, PROMPT_CONFIG);
   let lastError;
+  let attempts = 0;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
+    attempts = attempt + 1;
     try {
       const retryHint = attempt ? '\\n上一次输出为空或不完整。请立即从字符 { 开始输出完整 JSON，禁止输出空白或解释。' : '';
       const response = await fetch('https://api.deepseek.com/chat/completions', {
@@ -127,26 +154,33 @@ async function handleAnalyze(request, env) {
         })
       });
       const payload = await response.json().catch(() => ({}));
-      if (response.status === 429) throw Object.assign(new Error('上游限流，请稍后再试'), { code: 'RATE_LIMIT' });
-      if (!response.ok) return json({ error: payload?.error?.message || ('DeepSeek 请求失败（HTTP ' + response.status + '）'), code: 'UPSTREAM_ERROR' }, response.status);
+      if (!response.ok) throw Object.assign(new Error(payload?.error?.message || ('DeepSeek 请求失败（HTTP ' + response.status + '）')), {
+        code: upstreamCode(response.status),
+        retryAfter: Number(response.headers.get('retry-after')) || 0
+      });
       const result = parseModelJson(payload?.choices?.[0]?.message?.content);
       return json({
         analysis: result,
+        state: 'completed',
         model: payload.model || model,
         usage: payload.usage || null,
-        attempts: attempt + 1,
+        attempts,
         promptConfig: { applied: PROMPT_CONFIG.length, truncated: PROMPT_META.truncated, dropped: PROMPT_META.dropped }
       });
     } catch (error) {
       lastError = error;
-      const retryable = ['EMPTY_MODEL_OUTPUT', 'INVALID_MODEL_JSON', 'RATE_LIMIT'].includes(error.code) || error.name === 'TimeoutError';
+      if (error.name === 'TimeoutError') lastError = Object.assign(new Error('DeepSeek 单次分析超时'), { code: 'UPSTREAM_TIMEOUT' });
+      else if (error instanceof TypeError && !error.code) lastError = Object.assign(new Error('DeepSeek 模型服务暂时不可用'), { code: 'MODEL_UNAVAILABLE' });
+      const retryable = ['EMPTY_MODEL_OUTPUT', 'INVALID_MODEL_JSON', 'RATE_LIMIT', 'MODEL_UNAVAILABLE', 'UPSTREAM_TIMEOUT'].includes(lastError.code);
       if (!retryable || attempt === retries) break;
-      await new Promise(resolve => setTimeout(resolve, Math.min(400 * Math.pow(2, attempt), 4000)));
+      const backoff = lastError.retryAfter ? Math.min(lastError.retryAfter * 1000, 8000) : Math.min(400 * Math.pow(2, attempt), 4000);
+      await new Promise(resolve => setTimeout(resolve, backoff));
     }
   }
   const code = lastError?.code || (lastError?.name === 'TimeoutError' ? 'UPSTREAM_TIMEOUT' : 'ANALYZE_FAILED');
-  const status = code === 'RATE_LIMIT' ? 429 : lastError?.name === 'TimeoutError' ? 504 : 502;
-  return json({ error: (lastError?.message || 'DeepSeek 分析失败') + '，已自动重试，请稍后再试', code }, status);
+  const status = code === 'RATE_LIMIT' ? 429 : code === 'UPSTREAM_TIMEOUT' ? 504 : ['MODEL_UNAVAILABLE', 'MODEL_AUTH_ERROR'].includes(code) ? 503 : 502;
+  const degradation = degradationFor(code, lastError?.retryAfter);
+  return json({ error: degradation.message + (attempts > 1 ? '，已自动重试' : ''), code, degradation }, status);
 }
 
 export default {

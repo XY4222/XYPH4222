@@ -579,7 +579,8 @@ function pruneLogs() {
 const ERROR_LABEL = {
   MISSING_API_KEY: '未配置 API Key', UPSTREAM_TIMEOUT: '上游超时', EMPTY_MODEL_OUTPUT: '模型返回空内容',
   INVALID_MODEL_JSON: '模型 JSON 不完整', ANALYZE_FAILED: '分析失败', DISABLED: '后台已关闭分析',
-  BAD_REQUEST: '请求参数缺失', PAYLOAD_TOO_LARGE: '请求内容过大', RATE_LIMIT: '限流'
+  BAD_REQUEST: '请求参数缺失', PAYLOAD_TOO_LARGE: '请求内容过大', RATE_LIMIT: '限流',
+  MODEL_UNAVAILABLE: '模型暂时不可用', MODEL_AUTH_ERROR: '模型鉴权失败', MODEL_REQUEST_REJECTED: '模型拒绝请求'
 };
 
 function costOf(usage, settings) {

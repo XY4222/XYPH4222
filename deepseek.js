@@ -94,7 +94,16 @@ function parseModelJson(content) {
   return parsed;
 }
 
-const RETRYABLE = ['EMPTY_MODEL_OUTPUT', 'INVALID_MODEL_JSON', 'UPSTREAM_TIMEOUT'];
+const RETRYABLE = ['EMPTY_MODEL_OUTPUT', 'INVALID_MODEL_JSON', 'UPSTREAM_TIMEOUT', 'RATE_LIMIT', 'MODEL_UNAVAILABLE'];
+
+function upstreamCode(status) {
+  if (status === 429) return 'RATE_LIMIT';
+  if (status === 408) return 'UPSTREAM_TIMEOUT';
+  if (status === 401 || status === 403) return 'MODEL_AUTH_ERROR';
+  if ([502, 503, 504].includes(status) || status >= 500) return 'MODEL_UNAVAILABLE';
+  if (status === 404) return 'MODEL_UNAVAILABLE';
+  return 'MODEL_REQUEST_REJECTED';
+}
 
 async function analyzeResume(input, options = {}) {
   const settings = { ...FALLBACK_SETTINGS, ...(options.settings || {}) };
@@ -102,7 +111,7 @@ async function analyzeResume(input, options = {}) {
   const model = options.model || process.env.DEEPSEEK_MODEL || settings.model;
   if (!apiKey) throw Object.assign(new Error('服务端尚未配置 DEEPSEEK_API_KEY'), { statusCode: 503, code: 'MISSING_API_KEY' });
 
-  const maxAttempts = Math.max(1, Number(settings.retries) || 1);
+  const maxAttempts = Math.max(1, Math.min(6, Number(settings.retries) + 1 || 1));
   let lastError;
   let attempts = 0;
 
@@ -128,8 +137,8 @@ async function analyzeResume(input, options = {}) {
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
         throw Object.assign(new Error(payload?.error?.message || `DeepSeek 请求失败（HTTP ${response.status}）`), {
-          statusCode: response.status,
-          code: response.status === 429 ? 'RATE_LIMIT' : 'ANALYZE_FAILED',
+          statusCode: response.status === 429 ? 429 : response.status === 408 ? 504 : response.status >= 500 || [401, 403, 404].includes(response.status) ? 503 : 502,
+          code: upstreamCode(response.status),
           retryAfter: Number(response.headers.get('retry-after')) || 0
         });
       }
@@ -138,19 +147,25 @@ async function analyzeResume(input, options = {}) {
     } catch (error) {
       lastError = error.name === 'AbortError'
         ? Object.assign(new Error('DeepSeek 单次分析超时'), { statusCode: 504, code: 'UPSTREAM_TIMEOUT' })
-        : error;
+        : error instanceof TypeError && !error.code
+          ? Object.assign(new Error('DeepSeek 模型服务暂时不可用'), { statusCode: 503, code: 'MODEL_UNAVAILABLE' })
+          : error;
       lastError.attempts = attempts;
       if (!RETRYABLE.includes(lastError.code) || attempt === maxAttempts - 1) break;
       // 被限流时按上游要求退避，避免把重试变成压测
-      if (lastError.retryAfter) await new Promise(r => setTimeout(r, Math.min(lastError.retryAfter * 1000, 8000)));
+      const backoffMs = lastError.retryAfter
+        ? Math.min(lastError.retryAfter * 1000, 8000)
+        : Math.min(400 * Math.pow(2, attempt), 4000);
+      await new Promise(r => setTimeout(r, backoffMs));
     } finally { clearTimeout(timer); }
   }
 
   throw Object.assign(new Error(`${lastError?.message || 'DeepSeek 分析失败'}${attempts > 1 ? '，已自动重试' : ''}`), {
     statusCode: lastError?.statusCode || 502,
     code: lastError?.code || 'ANALYZE_FAILED',
-    attempts
+    attempts,
+    retryAfter: Number(lastError?.retryAfter) || 0
   });
 }
 
-module.exports = { SYSTEM_PROMPT, FALLBACK_SETTINGS, preparePromptConfig, buildUserPrompt, parseModelJson, analyzeResume };
+module.exports = { SYSTEM_PROMPT, FALLBACK_SETTINGS, preparePromptConfig, buildUserPrompt, parseModelJson, analyzeResume, upstreamCode };

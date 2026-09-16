@@ -142,6 +142,11 @@ tr:hover td { background: #fdfdfd; }
 .resume-item-head { display: flex; justify-content: space-between; gap: 18px; font-weight: 650; }
 .resume-item-head span:last-child { color: var(--muted); font-weight: 400; }
 .risk-strip { padding: 12px 14px; margin-bottom: 16px; color: #805a22; background: var(--amber-bg); border: 1px solid #f0dfbe; border-radius: 8px; font-size: 12px; }
+.service-status { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 14px; margin-bottom: 16px; color: #8d2c2c; background: #fff4f3; border: 1px solid #efcbc7; border-radius: 8px; font-size: 12px; }
+.service-status strong { font-size: 13px; }
+.service-status span { color: #785653; text-align: right; }
+.service-status.paused { color: #805a22; background: var(--amber-bg); border-color: #f0dfbe; }
+.service-status.running { color: #245576; background: #f0f7fb; border-color: #c9dfe9; }
 .interview-card { padding: 18px; display: flex; gap: 13px; }
 .interview-card .num { color: #a3a7ae; font-size: 11px; font-weight: 650; padding-top: 2px; }
 .interview-card h4 { margin: 0 0 7px; font-size: 13px; }

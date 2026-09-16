@@ -68,7 +68,7 @@ let analysis = {
 };
 
 const state = {
-  current: 'input', analyzed: false, answers: Array(8).fill(''), bullets: Array(8).fill(''), style: 'balanced', provider: null, riskCheck: null, runId: null, form: {...example, role:'',industry:'',company:'',stage:'',highlights:[],jd:'',resume:'',extra:''}
+  current: 'input', analyzed: false, analysisStatus: 'idle', answers: Array(8).fill(''), bullets: Array(8).fill(''), style: 'balanced', provider: null, riskCheck: null, runId: null, degradation: null, form: {...example, role:'',industry:'',company:'',stage:'',highlights:[],jd:'',resume:'',extra:''}
 };
 
 const $ = (s, root=document) => root.querySelector(s);
@@ -97,6 +97,7 @@ function render() {
 function renderInput() {
   const f=state.form, tags=['复杂业务抽象','ToB 产品设计','数据分析能力','AI 产品理解','0-1 产品落地','跨团队推动'];
   return `${pageHead(1,'输入求职材料','提供目标岗位与真实经历。DeepSeek 会建立 JD 要求与简历证据的逐项映射。','预计分析耗时 30–90 秒')}
+  ${state.degradation?`<div class="service-status ${escapeHtml(state.degradation.state)}"><strong>${escapeHtml(state.degradation.message||'本次分析未完成')}</strong><span>旧分析结果已作废${state.runId?` · 记录编号 ${escapeHtml(state.runId)}`:''}</span></div>`:''}
   <div class="form-card card"><h2 class="form-section-title"><span class="section-number">1</span>目标岗位</h2>
     <div class="grid two">
       <div class="field"><label>目标岗位 *</label><input id="role" value="${escapeHtml(f.role)}" placeholder="例如：AI 产品经理"></div>
@@ -111,7 +112,7 @@ function renderInput() {
     <div class="form-card card"><h2 class="form-section-title"><span class="section-number">3</span>原始简历</h2><div class="field"><label>当前简历内容 *</label><textarea id="resume" placeholder="粘贴简历全文…">${escapeHtml(f.resume)}</textarea></div></div>
   </div>
   <div class="form-card card"><h2 class="form-section-title"><span class="section-number">4</span>补充信息</h2><div class="field"><label>项目、数据与事实边界 <span class="hint">选填</span></label><textarea id="extra" style="min-height:110px" placeholder="补充代表项目、成果数据、不希望夸大的内容…">${escapeHtml(f.extra)}</textarea></div></div>
-  <div class="form-actions"><p>API Key 仅存在服务端 · 简历内容将发送至 DeepSeek 分析</p><div class="action-group"><button class="button secondary" data-action="example">使用示例数据</button><button class="button primary" data-action="analyze">使用 DeepSeek 分析 <span>→</span></button></div></div>`;
+  <div class="form-actions"><p>API Key 仅存在服务端 · 简历内容将发送至 DeepSeek 分析</p><div class="action-group"><button class="button secondary" data-action="example" ${state.analysisStatus==='running'?'disabled':''}>使用示例数据</button><button class="button primary" data-action="analyze" ${state.analysisStatus==='running'?'disabled':''}>${state.analysisStatus==='running'?'DeepSeek 正在分析，可能需要 30–90 秒…':'使用 DeepSeek 分析 <span>→</span>'}</button></div></div>`;
 }
 
 function renderJD() {
@@ -214,18 +215,22 @@ document.addEventListener('click', async e=>{
   const action=btn.dataset.action;
   if(action==='example'){ state.form={...example,highlights:[...example.highlights]}; render(); showToast('示例数据已填入'); }
   if(action==='analyze'){
+    if(state.analysisStatus==='running') return;
     collectForm();
     if(!state.form.role||!state.form.jd||!state.form.resume){ showToast('请先填写目标岗位、JD 和原始简历'); return; }
-    btn.disabled=true; btn.innerHTML='DeepSeek 正在分析，可能需要 30–90 秒…';
+    // 新请求开始即作废旧结果，避免失败后继续浏览过期分析。
+    analysis = {...analysis, duties: [], hard: [], implicit: [], ideal: [], keywords: [], capabilities: [], dimensions: [], issues: [], matches: [], questions: [], comparisons: [], interview: [], finalResume: '', intro: ''};
+    state.analyzed=false; state.analysisStatus='running'; state.degradation={state:'running',message:'正在连接模型并生成新分析'}; state.provider=null; state.riskCheck=null; state.runId=null;
+    render();
     try {
       const response=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(state.form)});
       const result=await response.json().catch(()=>({}));
-      if(!response.ok) throw new Error(result.error||`分析请求失败（HTTP ${response.status}）`);
+      if(!response.ok) { const error=new Error(result.error||`分析请求失败（HTTP ${response.status}）`); error.code=result.code; error.runId=result.runId; error.degradation=result.degradation; throw error; }
       analysis={...analysis,...result.analysis}; state.riskCheck=result.riskCheck||null; state.runId=result.runId||null;
       state.provider={model:result.model,usage:result.usage};
       state.answers=Array(analysis.questions.length).fill(''); state.bullets=Array(analysis.questions.length).fill('');
-      state.analyzed=true; state.current='jd'; render(); showToast(`DeepSeek 分析完成 · ${result.model||'模型'}`);
-    } catch(error) { btn.disabled=false; btn.innerHTML='使用 DeepSeek 分析 <span>→</span>'; showErrorDialog(error.message); }
+      state.analyzed=true; state.analysisStatus='completed'; state.degradation=null; state.current='jd'; render(); showToast(`DeepSeek 分析完成 · ${result.model||'模型'}`);
+    } catch(error) { state.analysisStatus='failed'; state.runId=error.runId||null; state.degradation=error.degradation || {state:'failed', retryable:true, message:error.message}; render(); const wait=error.degradation?.retryAfterSeconds; showErrorDialog(`${error.degradation?.message || error.message}${wait?`，建议 ${wait} 秒后再试`:''}`, error.degradation?.retryable !== false); }
   }
   if(action==='generate-bullets'){ $$('[data-answer]').forEach(x=>state.answers[+x.dataset.answer]=x.value.trim()); state.bullets=state.answers.map((a,i)=>a?`${a.replace(/[。！？]+$/,'')}；由此形成可验证的${analysis.questions[i][1].replace('用于','')}证据。`:''); state.current='optimize'; render(); showToast(state.answers.some(Boolean)?'已基于回答生成表达':'已按现有材料生成保守表达'); }
   if(action==='skip-questions'){ state.current='optimize';render(); }
@@ -234,6 +239,7 @@ document.addEventListener('click', async e=>{
   if(action==='copy-interview') copyText(interviewText(),'面试清单已复制');
   if(action==='placeholder') showDialog();
   if(action==='close-dialog'){ $('#dialog').classList.remove('open');$('#dialog').setAttribute('aria-hidden','true'); }
+  if(action==='retry-analysis'){ $('#dialog').classList.remove('open');$('#dialog').setAttribute('aria-hidden','true'); $('[data-action="analyze"]')?.click(); }
   if(action==='reset'){ showResetDialog(); }
 });
 
@@ -242,8 +248,8 @@ document.addEventListener('click', e=>{
 });
 document.addEventListener('input', e=>{ if(e.target.matches('[data-answer]')) state.answers[+e.target.dataset.answer]=e.target.value; });
 
-function showResetDialog(){ const d=$('#dialog'); d.innerHTML=`<div class="dialog"><h3>重新开始？</h3><p>当前填写内容和分析结果将被清空。</p><div class="dialog-actions"><button class="button secondary" data-action="close-dialog">取消</button><button class="button primary" id="confirmReset">确认清空</button></div></div>`; d.classList.add('open'); $('#confirmReset').onclick=()=>{state.current='input';state.analyzed=false;state.answers=Array(8).fill('');state.bullets=Array(8).fill('');state.form={...example,role:'',industry:'',company:'',stage:'',highlights:[],jd:'',resume:'',extra:''};d.classList.remove('open');render();showToast('已清空');}; }
+function showResetDialog(){ const d=$('#dialog'); d.innerHTML=`<div class="dialog"><h3>重新开始？</h3><p>当前填写内容和分析结果将被清空。</p><div class="dialog-actions"><button class="button secondary" data-action="close-dialog">取消</button><button class="button primary" id="confirmReset">确认清空</button></div></div>`; d.classList.add('open'); $('#confirmReset').onclick=()=>{state.current='input';state.analyzed=false;state.analysisStatus='idle';state.degradation=null;state.runId=null;state.provider=null;state.riskCheck=null;state.answers=Array(8).fill('');state.bullets=Array(8).fill('');state.form={...example,role:'',industry:'',company:'',stage:'',highlights:[],jd:'',resume:'',extra:''};d.classList.remove('open');render();showToast('已清空');}; }
 
-function showErrorDialog(message){ const d=$('#dialog'); d.innerHTML=`<div class="dialog"><h3>DeepSeek 分析未完成</h3><p>${escapeHtml(message)}</p><div class="dialog-actions"><button class="button primary" data-action="close-dialog">返回修改</button></div></div>`; d.classList.add('open'); d.setAttribute('aria-hidden','false'); }
+function showErrorDialog(message, retryable=true){ const d=$('#dialog'); d.innerHTML=`<div class="dialog"><h3>DeepSeek 分析未完成</h3><p>${escapeHtml(message)}</p><div class="dialog-actions"><button class="button secondary" data-action="close-dialog">返回修改</button>${retryable?'<button class="button primary" data-action="retry-analysis">重试本次分析</button>':''}</div></div>`; d.classList.add('open'); d.setAttribute('aria-hidden','false'); }
 
 render();

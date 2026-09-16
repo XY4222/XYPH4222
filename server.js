@@ -43,7 +43,9 @@ async function readBody(req, limit) {
     raw += chunk;
     if (raw.length > limit) throw Object.assign(new Error('请求内容过大'), { statusCode: 413, code: 'PAYLOAD_TOO_LARGE' });
   }
-  return raw ? JSON.parse(raw) : {};
+  if (!raw) return {};
+  try { return JSON.parse(raw); }
+  catch { throw Object.assign(new Error('请求 JSON 格式错误'), { statusCode: 400, code: 'BAD_REQUEST' }); }
 }
 
 /** 统一落盘一次调用结果；失败也要记录，否则失败率看板永远是 0。 */
@@ -69,6 +71,25 @@ function record(entry) {
   });
 }
 
+function degradationFor(code, retryAfter = 0) {
+  const wait = Math.max(0, Math.min(300, Number(retryAfter) || 0));
+  const table = {
+    DISABLED: { state: 'paused', retryable: false, message: '分析服务已由管理员暂停' },
+    RATE_LIMIT: { state: 'rate_limited', retryable: true, message: '分析请求较多，请稍后重试', defaultWait: 30 },
+    UPSTREAM_TIMEOUT: { state: 'timeout', retryable: true, message: '模型响应超时，可重试', defaultWait: 3 },
+    MODEL_UNAVAILABLE: { state: 'model_unavailable', retryable: true, message: '模型服务暂时不可用，可稍后重试', defaultWait: 10 },
+    MISSING_API_KEY: { state: 'configuration_error', retryable: false, message: '分析服务尚未完成配置' },
+    MODEL_AUTH_ERROR: { state: 'configuration_error', retryable: false, message: '模型服务鉴权失败，请联系管理员' },
+    MODEL_REQUEST_REJECTED: { state: 'request_rejected', retryable: false, message: '模型服务拒绝了本次请求，请联系管理员检查配置' },
+    EMPTY_MODEL_OUTPUT: { state: 'invalid_response', retryable: true, message: '模型未返回有效结果，可重试' },
+    INVALID_MODEL_JSON: { state: 'invalid_response', retryable: true, message: '模型返回内容不完整，可重试' },
+    BAD_REQUEST: { state: 'invalid_request', retryable: false, message: '请补全目标岗位、JD 和原始简历' },
+    PAYLOAD_TOO_LARGE: { state: 'invalid_request', retryable: false, message: '输入内容超过允许长度，请精简后重试' }
+  };
+  const { defaultWait = 0, ...meta } = table[code] || { state: 'failed', retryable: true, message: '本次分析未完成', defaultWait: 3 };
+  return { ...meta, retryAfterSeconds: wait || defaultWait };
+}
+
 async function handleAnalyze(req, res) {
   const started = Date.now();
   const settings = store.getSettings();
@@ -77,12 +98,12 @@ async function handleAnalyze(req, res) {
   try {
     input = await readBody(req, BODY_LIMIT);
     if (!input.role || !input.jd || !input.resume) {
-      record({ ok: false, code: 'BAD_REQUEST', error: '缺少目标岗位、JD 或原始简历', latencyMs: Date.now() - started });
-      return send(res, 400, { error: '缺少目标岗位、JD 或原始简历', code: 'BAD_REQUEST' });
+      const runId = record({ ok: false, code: 'BAD_REQUEST', error: '缺少目标岗位、JD 或原始简历', latencyMs: Date.now() - started });
+      return send(res, 400, { error: '缺少目标岗位、JD 或原始简历', code: 'BAD_REQUEST', runId, degradation: degradationFor('BAD_REQUEST') });
     }
     if (!settings.analyzeEnabled) {
-      record({ ok: false, code: 'DISABLED', error: '管理员已暂停分析服务', latencyMs: Date.now() - started, role: input.role });
-      return send(res, 503, { error: '管理员已暂停分析服务', code: 'DISABLED' });
+      const runId = record({ ok: false, code: 'DISABLED', error: '管理员已暂停分析服务', latencyMs: Date.now() - started, role: input.role });
+      return send(res, 503, { error: '管理员已暂停分析服务', code: 'DISABLED', runId, degradation: degradationFor('DISABLED') });
     }
 
     // Prompt 配置一律以服务端为准，前端不需要自己拼装，也就不会出现浏览器与服务端配置不一致
@@ -99,7 +120,7 @@ async function handleAnalyze(req, res) {
       inputChars: String(input.jd || '').length + String(input.resume || '').length
     });
     return send(res, 200, {
-      ...result,
+      ...result, state: 'completed',
       promptConfig: { applied: resolved.config.length, truncated: resolved.truncated, dropped: resolved.dropped }, riskCheck, runId
     });
   } catch (error) {
@@ -107,7 +128,11 @@ async function handleAnalyze(req, res) {
       ok: false, code: error.code || 'ANALYZE_FAILED', error: error.message || '分析失败',
       latencyMs: Date.now() - started, attempts: error.attempts, role: input?.role
     });
-    return send(res, error.statusCode || 500, { error: error.message || '分析失败', code: error.code || 'ANALYZE_FAILED', runId });
+    const code = error.code || 'ANALYZE_FAILED';
+    const degradation = degradationFor(code, error.retryAfter);
+    if (degradation.retryAfterSeconds > 0) res.setHeader('Retry-After', String(degradation.retryAfterSeconds));
+    const safeError = ['BAD_REQUEST', 'PAYLOAD_TOO_LARGE'].includes(code) ? (error.message || degradation.message) : degradation.message;
+    return send(res, error.statusCode || 500, { error: safeError, code, runId, degradation });
   }
 }
 
