@@ -473,7 +473,9 @@ function saveSettings(patch, actor) {
 /* ---------- 运行日志 ---------- */
 
 function appendLog(entry) {
-  const line = JSON.stringify({ id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`, ...entry });
+  const safeEntry = { ...entry };
+  if (!safeEntry.ok) safeEntry.error = ERROR_LABEL[safeEntry.code] || '调用失败';
+  const line = JSON.stringify({ id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`, ...safeEntry });
   try {
     fs.appendFileSync(FILES.logs, line + '\n', 'utf8');
   } catch (error) {
@@ -481,7 +483,7 @@ function appendLog(entry) {
   }
 }
 
-function readLogs({ limit = 200, days = 0, ok, code } = {}) {
+function readLogs({ limit = 200, days = 0, ok, code, model, prompt, role, minLatency = 0 } = {}) {
   const settings = getSettings();
   const since = days > 0 ? Date.now() - days * 86400000 : 0;
   const raw = fs.existsSync(FILES.logs) ? fs.readFileSync(FILES.logs, 'utf8') : '';
@@ -493,6 +495,10 @@ function readLogs({ limit = 200, days = 0, ok, code } = {}) {
       if (since && new Date(entry.at).getTime() < since) continue;
       if (ok !== undefined && !!entry.ok !== ok) continue;
       if (code && entry.code !== code) continue;
+      if (model && entry.model !== model && entry.modelReturned !== model) continue;
+      if (prompt && !(entry.prompts || []).includes(prompt)) continue;
+      if (role && !String(entry.role || '').toLowerCase().includes(String(role).toLowerCase())) continue;
+      if (Number(minLatency) > 0 && Number(entry.latencyMs || 0) < Number(minLatency)) continue;
       rows.push(entry);
     } catch { /* 跳过损坏行 */ }
   }
@@ -526,8 +532,16 @@ function costOf(usage, settings) {
   return (input / 1e6) * settings.inputPricePerM + (output / 1e6) * settings.outputPricePerM;
 }
 
-function logStats(days = 7) {
-  const { rows } = readLogs({ limit: Number.MAX_SAFE_INTEGER, days });
+function percentile(sorted, ratio) {
+  if (!sorted.length) return 0;
+  return sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * ratio) - 1))];
+}
+
+function logStats(days = 7, filters = {}) {
+  const { rows: allRows } = readLogs({ limit: Number.MAX_SAFE_INTEGER, days });
+  const models = [...new Set(allRows.flatMap(r => [r.model, r.modelReturned]).filter(Boolean))].sort();
+  const prompts = [...new Set(allRows.flatMap(r => r.prompts || []))].sort();
+  const { rows } = readLogs({ limit: Number.MAX_SAFE_INTEGER, days, ...filters });
   const settings = getSettings();
   const total = rows.length;
   const failed = rows.filter(r => !r.ok).length;
@@ -556,22 +570,45 @@ function logStats(days = 7) {
     }));
 
   const byCode = {};
+  const byModel = {};
+  const byPrompt = {};
   for (const r of rows) {
+    const model = r.modelReturned || r.model || 'unknown';
+    byModel[model] = byModel[model] || { model, total: 0, failed: 0, latencySum: 0, latencyCount: 0, tokens: 0, cost: 0 };
+    const modelBucket = byModel[model];
+    modelBucket.total += 1;
+    if (!r.ok) modelBucket.failed += 1;
+    if (r.ok) { modelBucket.latencySum += Number(r.latencyMs || 0); modelBucket.latencyCount += 1; }
+    modelBucket.tokens += Number(r.usage?.total_tokens || 0);
+    modelBucket.cost += costOf(r.usage, settings);
+    for (const promptName of r.prompts || []) {
+      byPrompt[promptName] = byPrompt[promptName] || { prompt: promptName, calls: 0, failed: 0, truncated: 0, dropped: 0 };
+      byPrompt[promptName].calls += 1;
+      if (!r.ok) byPrompt[promptName].failed += 1;
+      if ((r.truncated || []).some(item => item.name === promptName)) byPrompt[promptName].truncated += 1;
+      if ((r.dropped || []).some(item => item.name === promptName)) byPrompt[promptName].dropped += 1;
+    }
     if (r.ok) continue;
     const key = r.code || 'UNKNOWN';
     byCode[key] = byCode[key] || { code: key, label: ERROR_LABEL[key] || key, count: 0 };
     byCode[key].count += 1;
   }
 
-  const p95 = latencies.length ? latencies[Math.min(latencies.length - 1, Math.floor(latencies.length * 0.95))] : 0;
-
   return {
     total, failed, successRate: total ? Number(((total - failed) / total * 100).toFixed(1)) : 100,
     avgLatency: latencies.length ? Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length) : 0,
-    p95Latency: p95,
+    p50Latency: percentile(latencies, 0.5), p95Latency: percentile(latencies, 0.95), p99Latency: percentile(latencies, 0.99),
     tokens, cost: Number(cost.toFixed(4)),
     truncatedCalls: rows.filter(r => (r.truncated || []).length).length,
+    droppedCalls: rows.filter(r => (r.dropped || []).length).length,
+    retryCalls: rows.filter(r => Number(r.attempts || 1) > 1).length,
+    retryRate: total ? Number((rows.filter(r => Number(r.attempts || 1) > 1).length / total * 100).toFixed(1)) : 0,
+    avgInputChars: total ? Math.round(rows.reduce((sum, r) => sum + Number(r.inputChars || 0), 0) / total) : 0,
     daily, byCode: Object.values(byCode).sort((a, b) => b.count - a.count),
+    byModel: Object.values(byModel).map(item => ({ ...item, successRate: item.total ? Number(((item.total - item.failed) / item.total * 100).toFixed(1)) : 100, avgLatency: item.latencyCount ? Math.round(item.latencySum / item.latencyCount) : 0, cost: Number(item.cost.toFixed(4)) })).sort((a, b) => b.total - a.total),
+    byPrompt: Object.values(byPrompt).sort((a, b) => b.calls - a.calls),
+    slowest: rows.filter(r => r.ok).sort((a, b) => Number(b.latencyMs || 0) - Number(a.latencyMs || 0)).slice(0, 10).map(r => ({ id: r.id, at: r.at, latencyMs: r.latencyMs, model: r.modelReturned || r.model, role: r.role, prompts: r.prompts || [], inputChars: r.inputChars, attempts: r.attempts })),
+    filters: { models, prompts },
     settings: { inputPricePerM: settings.inputPricePerM, outputPricePerM: settings.outputPricePerM },
     days
   };

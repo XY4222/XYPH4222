@@ -18,7 +18,7 @@
     logs: [],
     logStats: null,
     logDays: 7,
-    logFilter: { ok: 'all' },
+    logFilter: { ok: 'all', model: '', prompt: '', role: '', minLatency: 0 },
     settings: null,
     testCases: [],
     testRuns: [],
@@ -513,6 +513,9 @@
           return `<div class="bar-row"><span class="name">${escapeHtml(c.label)}</span><span class="bar"><i style="width:${ratio.toFixed(1)}%"></i></span><span class="num">${c.count}</span></div>`;
         }).join('')
       : '<div class="empty" style="padding:20px">区间内没有失败调用</div>';
+    const modelRows = s.byModel.length ? s.byModel.map(item => `<tr><td>${escapeHtml(item.model)}</td><td>${item.total}</td><td>${item.successRate}%</td><td>${fmtLatency(item.avgLatency)}</td><td>${fmtNumber(item.tokens)}</td><td>¥${fmtCost(item.cost)}</td></tr>`).join('') : '';
+    const promptRows = s.byPrompt.length ? s.byPrompt.map(item => `<tr><td>${escapeHtml(item.prompt)}</td><td>${item.calls}</td><td>${item.failed}</td><td>${item.truncated}</td><td>${item.dropped}</td></tr>`).join('') : '';
+    const slowRows = s.slowest.length ? s.slowest.map(item => `<tr><td>${fullTime(item.at)}</td><td>${fmtLatency(item.latencyMs)}</td><td>${escapeHtml(item.model || '-')}</td><td>${escapeHtml(item.role || '-')}</td><td>${escapeHtml((item.prompts || []).join('、') || '-')}</td><td>${fmtNumber(item.inputChars)}</td><td>${item.attempts || 1}</td></tr>`).join('') : '';
 
     const rows = state.logs.map(l => {
       const status = l.ok ? tag('成功', 'green') : tag('失败', 'red');
@@ -545,12 +548,21 @@
           ${can('admin') ? '<button class="secondary" id="pruneLogs">清理过期</button>' : ''}
         </div>
       </div>
+      <section class="panel"><div class="toolbar">
+        <select class="filter" id="logModel"><option value="">全部模型</option>${s.filters.models.map(item => `<option value="${escapeHtml(item)}"${state.logFilter.model === item ? ' selected' : ''}>${escapeHtml(item)}</option>`).join('')}</select>
+        <select class="filter" id="logPrompt"><option value="">全部 Prompt</option>${s.filters.prompts.map(item => `<option value="${escapeHtml(item)}"${state.logFilter.prompt === item ? ' selected' : ''}>${escapeHtml(item)}</option>`).join('')}</select>
+        <input class="filter" id="logRole" placeholder="按岗位搜索" value="${escapeHtml(state.logFilter.role)}" />
+        <select class="filter" id="logMinLatency"><option value="0">全部耗时</option>${[1000,3000,5000,10000].map(ms => `<option value="${ms}"${state.logFilter.minLatency === ms ? ' selected' : ''}>≥ ${fmtLatency(ms)}</option>`).join('')}</select>
+        <button class="secondary" id="clearLogFilters">清除筛选</button>
+      </div></section>
       <section class="stats">
         <div class="stat"><label>总调用</label><strong>${fmtNumber(s.total)}</strong><small>近 ${s.days} 天</small></div>
         <div class="stat"><label>成功率</label><strong>${okRate}%</strong><small class="${s.failed === 0 ? 'good' : 'warn'}">失败 ${s.failed} 次</small></div>
-        <div class="stat"><label>平均耗时</label><strong>${fmtLatency(s.avgLatency)}</strong><small>P95 ${fmtLatency(s.p95Latency)}</small></div>
+        <div class="stat"><label>平均耗时</label><strong>${fmtLatency(s.avgLatency)}</strong><small>P50 ${fmtLatency(s.p50Latency)} · P95 ${fmtLatency(s.p95Latency)} · P99 ${fmtLatency(s.p99Latency)}</small></div>
         <div class="stat"><label>Token 用量</label><strong>${fmtNumber(s.tokens)}</strong><small>${s.truncatedCalls ? `<span class="warn">${s.truncatedCalls} 次调用发生截断</span>` : '无截断事件'}</small></div>
         <div class="stat"><label>预估成本</label><strong>${fmtCost(s.cost)}</strong><small>¥ · 按项目设置单价折算</small></div>
+        <div class="stat"><label>重试率</label><strong>${s.retryRate}%</strong><small>${s.retryCalls} 次重试 · ${s.droppedCalls} 次丢弃</small></div>
+        <div class="stat"><label>平均输入规模</label><strong>${fmtNumber(s.avgInputChars)}</strong><small>字符/次，不保存输入原文</small></div>
       </section>
       <div class="grid2">
         <section class="panel">
@@ -562,6 +574,8 @@
           <div style="padding:14px 18px">${errorBars}</div>
         </section>
       </div>
+      <div class="grid2"><section class="panel"><div class="panel-head"><div><h2>模型表现</h2><p>成功率、耗时与成本</p></div></div>${modelRows ? `<table class="table"><thead><tr><th>模型</th><th>调用</th><th>成功率</th><th>平均耗时</th><th>Token</th><th>成本</th></tr></thead><tbody>${modelRows}</tbody></table>` : '<div class="empty">暂无模型数据</div>'}</section><section class="panel"><div class="panel-head"><div><h2>Prompt 使用与截断</h2><p>定位高频、截断和丢弃配置</p></div></div>${promptRows ? `<table class="table"><thead><tr><th>Prompt</th><th>调用</th><th>失败</th><th>截断</th><th>丢弃</th></tr></thead><tbody>${promptRows}</tbody></table>` : '<div class="empty">暂无 Prompt 数据</div>'}</section></div>
+      <section class="panel"><div class="panel-head"><div><h2>最慢请求 Top 10</h2><p>仅展示元数据，不保存 JD 或简历原文</p></div></div>${slowRows ? `<table class="table"><thead><tr><th>时间</th><th>耗时</th><th>模型</th><th>岗位</th><th>Prompt</th><th>输入字符</th><th>尝试</th></tr></thead><tbody>${slowRows}</tbody></table>` : '<div class="empty">暂无成功请求</div>'}</section>
       <section class="panel">
         <div class="panel-head">
           <div><h2>调用明细</h2><p>点击「刷新」或切换区间重新拉取</p></div>
@@ -853,7 +867,9 @@
     try {
       const params = new URLSearchParams({ days: String(state.logDays), limit: '200' });
       if (state.logFilter.ok !== 'all') params.set('ok', state.logFilter.ok);
-      const [stats, logs] = await Promise.all([api(`/api/logs/stats?days=${state.logDays}`), api(`/api/logs?${params}`)]);
+      ['model', 'prompt', 'role'].forEach(key => { if (state.logFilter[key]) params.set(key, state.logFilter[key]); });
+      if (state.logFilter.minLatency) params.set('minLatency', String(state.logFilter.minLatency));
+      const [stats, logs] = await Promise.all([api(`/api/logs/stats?${params}`), api(`/api/logs?${params}`)]);
       state.logStats = stats;
       state.logs = logs.items;
       render();
@@ -1009,6 +1025,20 @@
       state.logFilter.ok = btn.dataset.logfilter;
       loadLogs();
     }));
+    const bindLogFilter = (id, key, transform = value => value) => {
+      const el = $(id);
+      if (el) el.addEventListener('change', () => { state.logFilter[key] = transform(el.value); loadLogs(); });
+    };
+    bindLogFilter('#logModel', 'model');
+    bindLogFilter('#logPrompt', 'prompt');
+    bindLogFilter('#logMinLatency', 'minLatency', Number);
+    const logRole = $('#logRole');
+    if (logRole) {
+      let roleTimer;
+      logRole.addEventListener('input', () => { clearTimeout(roleTimer); roleTimer = setTimeout(() => { state.logFilter.role = logRole.value.trim(); loadLogs(); }, 300); });
+    }
+    const clearLogFilters = $('#clearLogFilters');
+    if (clearLogFilters) clearLogFilters.addEventListener('click', () => { state.logFilter = { ok: 'all', model: '', prompt: '', role: '', minLatency: 0 }; loadLogs(); });
 
     // 项目设置
     const saveSettings = $('#saveSettings');

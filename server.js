@@ -354,7 +354,11 @@ const routes = {
       limit: Number(url.searchParams.get('limit') || 200),
       days: Number(url.searchParams.get('days') || 0),
       ok: okParam === 'true' ? true : okParam === 'false' ? false : undefined,
-      code: url.searchParams.get('code') || undefined
+      code: url.searchParams.get('code') || undefined,
+      model: url.searchParams.get('model') || undefined,
+      prompt: url.searchParams.get('prompt') || undefined,
+      role: url.searchParams.get('role') || undefined,
+      minLatency: Number(url.searchParams.get('minLatency') || 0)
     });
     send(res, 200, {
       items: result.rows, total: result.total,
@@ -362,7 +366,12 @@ const routes = {
     });
   },
 
-  'GET /api/logs/stats': (req, res, url) => send(res, 200, store.logStats(Number(url.searchParams.get('days') || 7))),
+  'GET /api/logs/stats': (req, res, url) => send(res, 200, store.logStats(Number(url.searchParams.get('days') || 7), {
+    model: url.searchParams.get('model') || undefined,
+    prompt: url.searchParams.get('prompt') || undefined,
+    role: url.searchParams.get('role') || undefined,
+    minLatency: Number(url.searchParams.get('minLatency') || 0)
+  })),
 
   'GET /api/test-cases': (req, res, url) => send(res, 200, { items: store.listTestCases(url.searchParams.get('promptId')) }),
 
