@@ -49,7 +49,11 @@ const DEFAULT_SETTINGS = {
   promptMaxCount: 20,
   inputPricePerM: 2,
   outputPricePerM: 8,
-  logRetentionDays: 30
+  logRetentionDays: 30,
+  alertFailureRate: 30,
+  alertSchemaErrorRate: 10,
+  alertRetryRate: 50,
+  alertMinCalls: 10
 };
 
 const SEED = [
@@ -597,7 +601,8 @@ function saveSettings(patch, actor) {
   const numeric = {
     temperature: [0, 2], maxTokens: [256, 32000], timeoutMs: [5000, 300000], retries: [0, 5],
     promptMaxChars: [200, 60000], promptMaxCount: [1, 50], inputPricePerM: [0, 10000],
-    outputPricePerM: [0, 10000], logRetentionDays: [1, 365]
+    outputPricePerM: [0, 10000], logRetentionDays: [1, 365], alertFailureRate: [0, 100],
+    alertSchemaErrorRate: [0, 100], alertRetryRate: [0, 100], alertMinCalls: [1, 10000]
   };
   for (const [key, [min, max]] of Object.entries(numeric)) {
     const value = Number(next[key]);
@@ -767,6 +772,25 @@ function logStats(days = 7, filters = {}) {
     byCode[key].count += 1;
   }
 
+  const alertMinCalls = Number(settings.alertMinCalls || DEFAULT_SETTINGS.alertMinCalls);
+  const alerts = [];
+  const addAlert = (scope, metric, rate, threshold, calls, message) => {
+    if (calls >= alertMinCalls && threshold > 0 && rate >= threshold) alerts.push({ scope, metric, rate, threshold, calls, message });
+  };
+  addAlert('overall', 'failureRate', total ? failed / total * 100 : 0, Number(settings.alertFailureRate), total, `整体失败率 ${total ? (failed / total * 100).toFixed(1) : '0.0'}% 超过阈值`);
+  const schemaErrorCount = Object.values(schemaFields).reduce((sum, count) => sum + count, 0);
+  addAlert('overall', 'schemaErrorRate', total ? schemaErrorCount / total * 100 : 0, Number(settings.alertSchemaErrorRate), total, `整体 Schema 错误率 ${total ? (schemaErrorCount / total * 100).toFixed(1) : '0.0'}% 超过阈值`);
+  const retryCount = rows.filter(r => Number(r.attempts || 1) > 1).length;
+  addAlert('overall', 'retryRate', total ? retryCount / total * 100 : 0, Number(settings.alertRetryRate), total, `整体重试率 ${total ? (retryCount / total * 100).toFixed(1) : '0.0'}% 超过阈值`);
+  for (const item of Object.values(byPromptVersion)) {
+    const failureRate = item.calls ? item.failed / item.calls * 100 : 0;
+    const schemaRate = item.calls ? item.schemaErrors / item.calls * 100 : 0;
+    const retryRate = item.calls ? item.retries / item.calls * 100 : 0;
+    const label = `${item.prompt}@${item.version}`;
+    addAlert(label, 'failureRate', failureRate, Number(settings.alertFailureRate), item.calls, `${label} 失败率 ${failureRate.toFixed(1)}% 超过阈值`);
+    addAlert(label, 'schemaErrorRate', schemaRate, Number(settings.alertSchemaErrorRate), item.calls, `${label} Schema 错误率 ${schemaRate.toFixed(1)}% 超过阈值`);
+    addAlert(label, 'retryRate', retryRate, Number(settings.alertRetryRate), item.calls, `${label} 重试率 ${retryRate.toFixed(1)}% 超过阈值`);
+  }
   return {
     total, failed, successRate: total ? Number(((total - failed) / total * 100).toFixed(1)) : 100,
     avgLatency: latencies.length ? Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length) : 0,
@@ -784,7 +808,8 @@ function logStats(days = 7, filters = {}) {
     byPromptVersion: Object.values(byPromptVersion).map(item => ({ ...item, failureRate: item.calls ? Number((item.failed / item.calls * 100).toFixed(1)) : 0, retryRate: item.calls ? Number((item.retries / item.calls * 100).toFixed(1)) : 0, avgLatency: item.latencyCount ? Math.round(item.latencySum / item.latencyCount) : 0, cost: Number(item.cost.toFixed(4)) })).sort((a, b) => b.calls - a.calls),
     slowest: rows.filter(r => r.ok).sort((a, b) => Number(b.latencyMs || 0) - Number(a.latencyMs || 0)).slice(0, 10).map(r => ({ id: r.id, at: r.at, latencyMs: r.latencyMs, model: r.modelReturned || r.model, role: r.role, prompts: r.prompts || [], inputChars: r.inputChars, attempts: r.attempts })),
     filters: { models, prompts },
-    settings: { inputPricePerM: settings.inputPricePerM, outputPricePerM: settings.outputPricePerM },
+    alerts: alerts.sort((a, b) => b.rate - a.rate),
+    settings: { inputPricePerM: settings.inputPricePerM, outputPricePerM: settings.outputPricePerM, alertFailureRate: settings.alertFailureRate, alertSchemaErrorRate: settings.alertSchemaErrorRate, alertRetryRate: settings.alertRetryRate, alertMinCalls: settings.alertMinCalls },
     days
   };
 }

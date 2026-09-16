@@ -11,6 +11,7 @@ let passed = 0; let failed = 0;
 function check(label, ok) { if (ok) { passed++; console.log(`  ✓ ${label}`); } else { failed++; console.log(`  ✗ ${label}`); } }
 try {
   const now = new Date().toISOString();
+  store.saveSettings({ alertFailureRate: 25, alertSchemaErrorRate: 25, alertRetryRate: 25, alertMinCalls: 1 }, '监控测试');
   store.appendLog({ at: now, ok: true, model: 'model-a', modelReturned: 'model-a', latencyMs: 1000, attempts: 1, role: '产品经理', prompts: ['JD 解析'], promptVersions: [{ name: 'JD 解析', version: 'v1.0' }], usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 }, inputChars: 500, truncated: [], dropped: [] });
   store.appendLog({ at: now, ok: true, model: 'model-a', modelReturned: 'model-a', latencyMs: 5000, attempts: 2, role: '运营经理', prompts: ['JD 解析', '简历诊断'], promptVersions: [{ name: 'JD 解析', version: 'v1.1' }, { name: '简历诊断', version: 'v1.0' }], usage: { prompt_tokens: 200, completion_tokens: 100, total_tokens: 300 }, inputChars: 1500, truncated: [{ name: 'JD 解析' }], dropped: [{ name: '简历诊断' }] });
   store.appendLog({ at: now, ok: false, model: 'model-b', latencyMs: 200, attempts: 1, role: '产品经理', prompts: ['简历诊断'], code: 'UPSTREAM_TIMEOUT', error: 'SENSITIVE_RESUME_SHOULD_NOT_PERSIST' });
@@ -28,6 +29,7 @@ try {
   check('Schema 错误字段进入聚合统计', stats.schemaFields.some(item => item.field === 'score' && item.count >= 1) && stats.schemaFields.some(item => item.field === 'dimensions.score'));
   check('Prompt 版本进入质量对比统计', stats.byPromptVersion.some(item => item.prompt === 'JD 解析' && item.version === 'v1.1' && item.calls === 1 && item.retryRate === 100));
   check('失败调用也关联实际 Prompt 版本', stats.byPromptVersion.some(item => item.prompt === '简历诊断' && item.version === 'v1.0' && item.failed === 1 && item.schemaErrors === 1));
+  check('异常阈值告警按区间统计触发', stats.alerts.some(item => item.scope === 'overall' && item.metric === 'failureRate') && stats.alerts.some(item => item.scope === '简历诊断@v1.0' && item.metric === 'schemaErrorRate'));
   const statWithFilter = store.logStats(7, { model: 'model-a', minLatency: 3000 });
   check('统计接口与明细接口使用同一筛选口径', statWithFilter.total === 1 && statWithFilter.byModel[0].model === 'model-a');
 } finally { try { fs.rmSync(staged, { recursive: true, force: true }); } catch {} }

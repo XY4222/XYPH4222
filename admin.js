@@ -550,6 +550,7 @@
     const modelRows = s.byModel.length ? s.byModel.map(item => `<tr><td>${escapeHtml(item.model)}</td><td>${item.total}</td><td>${item.successRate}%</td><td>${fmtLatency(item.avgLatency)}</td><td>${fmtNumber(item.tokens)}</td><td>¥${fmtCost(item.cost)}</td></tr>`).join('') : '';
     const promptRows = s.byPrompt.length ? s.byPrompt.map(item => `<tr><td>${escapeHtml(item.prompt)}</td><td>${item.calls}</td><td>${item.failed}</td><td>${item.truncated}</td><td>${item.dropped}</td></tr>`).join('') : '';
     const promptVersionRows = (s.byPromptVersion || []).length ? s.byPromptVersion.map(item => `<tr><td>${escapeHtml(item.prompt)}</td><td>${escapeHtml(item.version)}</td><td>${item.calls}</td><td>${item.failureRate}%</td><td>${item.retryRate}%</td><td>${fmtLatency(item.avgLatency)}</td><td>¥${fmtCost(item.cost)}</td><td>${item.schemaErrors}</td></tr>`).join('') : '';
+    const alertRows = (s.alerts || []).map(item => `<div class="banner warn show"><strong>${escapeHtml(item.scope)}</strong> · ${escapeHtml(item.message)}（${item.calls} 次调用，阈值 ${item.threshold}%）</div>`).join('');
     const slowRows = s.slowest.length ? s.slowest.map(item => `<tr><td>${fullTime(item.at)}</td><td>${fmtLatency(item.latencyMs)}</td><td>${escapeHtml(item.model || '-')}</td><td>${escapeHtml(item.role || '-')}</td><td>${escapeHtml((item.prompts || []).join('、') || '-')}</td><td>${fmtNumber(item.inputChars)}</td><td>${item.attempts || 1}</td></tr>`).join('') : '';
 
     const rows = state.logs.map(l => {
@@ -601,6 +602,7 @@
         <div class="stat"><label>平均输入规模</label><strong>${fmtNumber(s.avgInputChars)}</strong><small>字符/次，不保存输入原文</small></div>
         <div class="stat"><label>Schema 结构错误</label><strong>${fmtNumber((s.schemaFields || []).reduce((sum, item) => sum + item.count, 0))}</strong><small>${(s.schemaFields || []).slice(0, 3).map(item => `${escapeHtml(item.field)} ${item.count} 次`).join(' · ') || '无结构错误'}</small></div>
       </section>
+      ${alertRows || '<div class="banner good show">当前区间没有触发异常阈值告警</div>'}
       <div class="grid2">
         <section class="panel">
           <div class="panel-head"><div><h2>每日调用量</h2><p>失败调用叠加显示</p></div></div>
@@ -671,6 +673,10 @@
             <div class="field"><label>输入单价（元 / 百万 token）</label><input id="s-inputPricePerM" type="number" step="0.1" min="0" value="${s.inputPricePerM}" /></div>
             <div class="field"><label>输出单价（元 / 百万 token）</label><input id="s-outputPricePerM" type="number" step="0.1" min="0" value="${s.outputPricePerM}" /></div>
             <div class="field"><label>日志保留天数（1–365）</label><input id="s-logRetentionDays" type="number" min="1" max="365" value="${s.logRetentionDays}" /></div>
+            <div class="field"><label>失败率告警阈值（%）</label><input id="s-alertFailureRate" type="number" min="0" max="100" value="${s.alertFailureRate}" /><div class="hint">设为 0 可关闭该项告警</div></div>
+            <div class="field"><label>Schema 错误率告警阈值（%）</label><input id="s-alertSchemaErrorRate" type="number" min="0" max="100" value="${s.alertSchemaErrorRate}" /></div>
+            <div class="field"><label>重试率告警阈值（%）</label><input id="s-alertRetryRate" type="number" min="0" max="100" value="${s.alertRetryRate}" /></div>
+            <div class="field"><label>触发告警的最少调用数</label><input id="s-alertMinCalls" type="number" min="1" max="10000" value="${s.alertMinCalls}" /></div>
           </div>
           <div style="display:flex;justify-content:flex-end;gap:9px;margin-top:6px">
             <button class="secondary" id="reloadSettings">放弃修改</button>
@@ -1164,7 +1170,7 @@
     const saveSettings = $('#saveSettings');
     if (saveSettings) saveSettings.addEventListener('click', async () => {
       const payload = { actor: '管理员' };
-      ['model', 'temperature', 'maxTokens', 'timeoutMs', 'retries', 'promptMaxChars', 'promptMaxCount', 'inputPricePerM', 'outputPricePerM', 'logRetentionDays'].forEach(key => {
+      ['model', 'temperature', 'maxTokens', 'timeoutMs', 'retries', 'promptMaxChars', 'promptMaxCount', 'inputPricePerM', 'outputPricePerM', 'logRetentionDays', 'alertFailureRate', 'alertSchemaErrorRate', 'alertRetryRate', 'alertMinCalls'].forEach(key => {
         payload[key] = $('#s-' + key).value;
       });
       payload.analyzeEnabled = $('#s-analyzeEnabled').value === 'true';
