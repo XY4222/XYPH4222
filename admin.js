@@ -558,6 +558,7 @@
       if ((l.truncated || []).length) notes.push(`<span class="tag amber">截断 ${l.truncated.length} 条</span>`);
       if ((l.dropped || []).length) notes.push(`<span class="tag amber">超量丢弃 ${l.dropped.length} 条</span>`);
       if ((l.attempts || 1) > 1) notes.push(`<span class="tag grey">重试 ${l.attempts} 次</span>`);
+      if ((l.validationErrors || []).length) notes.push(`<span class="tag red" title="${escapeHtml(l.validationErrors.join('、'))}">结构字段 ${l.validationErrors.length} 个</span>`);
       return `<tr>
         <td class="prompt-meta" title="${fullTime(l.at)}">${timeAgo(l.at)}</td>
         <td>${status}</td>
@@ -597,6 +598,7 @@
         <div class="stat"><label>预估成本</label><strong>${fmtCost(s.cost)}</strong><small>¥ · 按项目设置单价折算</small></div>
         <div class="stat"><label>重试率</label><strong>${s.retryRate}%</strong><small>${s.retryCalls} 次重试 · ${s.droppedCalls} 次丢弃</small></div>
         <div class="stat"><label>平均输入规模</label><strong>${fmtNumber(s.avgInputChars)}</strong><small>字符/次，不保存输入原文</small></div>
+        <div class="stat"><label>Schema 结构错误</label><strong>${fmtNumber((s.schemaFields || []).reduce((sum, item) => sum + item.count, 0))}</strong><small>${(s.schemaFields || []).slice(0, 3).map(item => `${escapeHtml(item.field)} ${item.count} 次`).join(' · ') || '无结构错误'}</small></div>
       </section>
       <div class="grid2">
         <section class="panel">

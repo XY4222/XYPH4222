@@ -67,7 +67,8 @@ function record(entry) {
     riskHits: entry.riskHits || [],
     truncated: entry.truncated || [],
     dropped: entry.dropped || [],
-    inputChars: entry.inputChars || 0
+    inputChars: entry.inputChars || 0,
+    validationErrors: entry.validationErrors || []
   });
 }
 
@@ -127,7 +128,7 @@ async function handleAnalyze(req, res) {
   } catch (error) {
     const runId = record({
       ok: false, code: error.code || 'ANALYZE_FAILED', error: error.message || '分析失败',
-      latencyMs: Date.now() - started, attempts: error.attempts, role: input?.role
+      latencyMs: Date.now() - started, attempts: error.attempts, role: input?.role, validationErrors: error.validationErrors || []
     });
     const code = error.code || 'ANALYZE_FAILED';
     const degradation = degradationFor(code, error.retryAfter);

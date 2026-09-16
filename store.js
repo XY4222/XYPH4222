@@ -619,6 +619,9 @@ function saveSettings(patch, actor) {
 
 function appendLog(entry) {
   const safeEntry = { ...entry };
+  safeEntry.validationErrors = Array.isArray(safeEntry.validationErrors)
+    ? safeEntry.validationErrors.map(item => String(item).replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 80)).filter(Boolean).slice(0, 12)
+    : [];
   if (!safeEntry.ok) safeEntry.error = ERROR_LABEL[safeEntry.code] || '调用失败';
   const row = { id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`, ...safeEntry };
   const line = JSON.stringify(row);
@@ -722,6 +725,7 @@ function logStats(days = 7, filters = {}) {
     }));
 
   const byCode = {};
+  const schemaFields = {};
   const byModel = {};
   const byPrompt = {};
   for (const r of rows) {
@@ -741,6 +745,7 @@ function logStats(days = 7, filters = {}) {
       if ((r.dropped || []).some(item => item.name === promptName)) byPrompt[promptName].dropped += 1;
     }
     if (r.ok) continue;
+    for (const field of r.validationErrors || []) schemaFields[field] = (schemaFields[field] || 0) + 1;
     const key = r.code || 'UNKNOWN';
     byCode[key] = byCode[key] || { code: key, label: ERROR_LABEL[key] || key, count: 0 };
     byCode[key].count += 1;
@@ -757,6 +762,7 @@ function logStats(days = 7, filters = {}) {
     retryRate: total ? Number((rows.filter(r => Number(r.attempts || 1) > 1).length / total * 100).toFixed(1)) : 0,
     avgInputChars: total ? Math.round(rows.reduce((sum, r) => sum + Number(r.inputChars || 0), 0) / total) : 0,
     daily, byCode: Object.values(byCode).sort((a, b) => b.count - a.count),
+    schemaFields: Object.entries(schemaFields).map(([field, count]) => ({ field, count })).sort((a, b) => b.count - a.count),
     byModel: Object.values(byModel).map(item => ({ ...item, successRate: item.total ? Number(((item.total - item.failed) / item.total * 100).toFixed(1)) : 100, avgLatency: item.latencyCount ? Math.round(item.latencySum / item.latencyCount) : 0, cost: Number(item.cost.toFixed(4)) })).sort((a, b) => b.total - a.total),
     byPrompt: Object.values(byPrompt).sort((a, b) => b.calls - a.calls),
     slowest: rows.filter(r => r.ok).sort((a, b) => Number(b.latencyMs || 0) - Number(a.latencyMs || 0)).slice(0, 10).map(r => ({ id: r.id, at: r.at, latencyMs: r.latencyMs, model: r.modelReturned || r.model, role: r.role, prompts: r.prompts || [], inputChars: r.inputChars, attempts: r.attempts })),
