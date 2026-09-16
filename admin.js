@@ -549,6 +549,7 @@
       : '<div class="empty" style="padding:20px">区间内没有失败调用</div>';
     const modelRows = s.byModel.length ? s.byModel.map(item => `<tr><td>${escapeHtml(item.model)}</td><td>${item.total}</td><td>${item.successRate}%</td><td>${fmtLatency(item.avgLatency)}</td><td>${fmtNumber(item.tokens)}</td><td>¥${fmtCost(item.cost)}</td></tr>`).join('') : '';
     const promptRows = s.byPrompt.length ? s.byPrompt.map(item => `<tr><td>${escapeHtml(item.prompt)}</td><td>${item.calls}</td><td>${item.failed}</td><td>${item.truncated}</td><td>${item.dropped}</td></tr>`).join('') : '';
+    const promptVersionRows = (s.byPromptVersion || []).length ? s.byPromptVersion.map(item => `<tr><td>${escapeHtml(item.prompt)}</td><td>${escapeHtml(item.version)}</td><td>${item.calls}</td><td>${item.failureRate}%</td><td>${item.retryRate}%</td><td>${fmtLatency(item.avgLatency)}</td><td>¥${fmtCost(item.cost)}</td><td>${item.schemaErrors}</td></tr>`).join('') : '';
     const slowRows = s.slowest.length ? s.slowest.map(item => `<tr><td>${fullTime(item.at)}</td><td>${fmtLatency(item.latencyMs)}</td><td>${escapeHtml(item.model || '-')}</td><td>${escapeHtml(item.role || '-')}</td><td>${escapeHtml((item.prompts || []).join('、') || '-')}</td><td>${fmtNumber(item.inputChars)}</td><td>${item.attempts || 1}</td></tr>`).join('') : '';
 
     const rows = state.logs.map(l => {
@@ -611,6 +612,7 @@
         </section>
       </div>
       <div class="grid2"><section class="panel"><div class="panel-head"><div><h2>模型表现</h2><p>成功率、耗时与成本</p></div></div>${modelRows ? `<table class="table"><thead><tr><th>模型</th><th>调用</th><th>成功率</th><th>平均耗时</th><th>Token</th><th>成本</th></tr></thead><tbody>${modelRows}</tbody></table>` : '<div class="empty">暂无模型数据</div>'}</section><section class="panel"><div class="panel-head"><div><h2>Prompt 使用与截断</h2><p>定位高频、截断和丢弃配置</p></div></div>${promptRows ? `<table class="table"><thead><tr><th>Prompt</th><th>调用</th><th>失败</th><th>截断</th><th>丢弃</th></tr></thead><tbody>${promptRows}</tbody></table>` : '<div class="empty">暂无 Prompt 数据</div>'}</section></div>
+      <section class="panel"><div class="panel-head"><div><h2>Prompt 版本质量对比</h2><p>按实际生效版本比较失败率、重试率、耗时、成本和 Schema 错误</p></div></div>${promptVersionRows ? `<table class="table"><thead><tr><th>Prompt</th><th>版本</th><th>调用</th><th>失败率</th><th>重试率</th><th>平均耗时</th><th>成本</th><th>Schema 错误</th></tr></thead><tbody>${promptVersionRows}</tbody></table>` : '<div class="empty">暂无 Prompt 版本数据</div>'}</section>
       <section class="panel"><div class="panel-head"><div><h2>最慢请求 Top 10</h2><p>仅展示元数据，不保存 JD 或简历原文</p></div></div>${slowRows ? `<table class="table"><thead><tr><th>时间</th><th>耗时</th><th>模型</th><th>岗位</th><th>Prompt</th><th>输入字符</th><th>尝试</th></tr></thead><tbody>${slowRows}</tbody></table>` : '<div class="empty">暂无成功请求</div>'}</section>
       <section class="panel">
         <div class="panel-head">

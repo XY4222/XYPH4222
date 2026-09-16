@@ -619,6 +619,9 @@ function saveSettings(patch, actor) {
 
 function appendLog(entry) {
   const safeEntry = { ...entry };
+  safeEntry.promptVersions = Array.isArray(safeEntry.promptVersions)
+    ? safeEntry.promptVersions.map(item => ({ name: String(item?.name || '').slice(0, 80), version: String(item?.version || 'unknown').slice(0, 40) })).filter(item => item.name).slice(0, 30)
+    : [];
   safeEntry.validationErrors = Array.isArray(safeEntry.validationErrors)
     ? safeEntry.validationErrors.map(item => String(item).replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 80)).filter(Boolean).slice(0, 12)
     : [];
@@ -728,6 +731,7 @@ function logStats(days = 7, filters = {}) {
   const schemaFields = {};
   const byModel = {};
   const byPrompt = {};
+  const byPromptVersion = {};
   for (const r of rows) {
     const model = r.modelReturned || r.model || 'unknown';
     byModel[model] = byModel[model] || { model, total: 0, failed: 0, latencySum: 0, latencyCount: 0, tokens: 0, cost: 0 };
@@ -743,6 +747,18 @@ function logStats(days = 7, filters = {}) {
       if (!r.ok) byPrompt[promptName].failed += 1;
       if ((r.truncated || []).some(item => item.name === promptName)) byPrompt[promptName].truncated += 1;
       if ((r.dropped || []).some(item => item.name === promptName)) byPrompt[promptName].dropped += 1;
+    }
+    const promptVersions = Array.isArray(r.promptVersions) ? r.promptVersions : [];
+    const callCost = costOf(r.usage, settings);
+    const perPromptVersionCost = promptVersions.length ? callCost / promptVersions.length : 0;
+    for (const item of promptVersions) {
+      const key = `${item.name}@${item.version}`;
+      byPromptVersion[key] = byPromptVersion[key] || { prompt: item.name, version: item.version, calls: 0, failed: 0, schemaErrors: 0, retries: 0, latencySum: 0, latencyCount: 0, cost: 0 };
+      const bucket = byPromptVersion[key];
+      bucket.calls += 1; if (!r.ok) bucket.failed += 1; if ((r.validationErrors || []).length) bucket.schemaErrors += 1;
+      if (Number(r.attempts || 1) > 1) bucket.retries += 1;
+      if (r.ok) { bucket.latencySum += Number(r.latencyMs || 0); bucket.latencyCount += 1; }
+      bucket.cost += perPromptVersionCost;
     }
     if (r.ok) continue;
     for (const field of r.validationErrors || []) schemaFields[field] = (schemaFields[field] || 0) + 1;
@@ -765,6 +781,7 @@ function logStats(days = 7, filters = {}) {
     schemaFields: Object.entries(schemaFields).map(([field, count]) => ({ field, count })).sort((a, b) => b.count - a.count),
     byModel: Object.values(byModel).map(item => ({ ...item, successRate: item.total ? Number(((item.total - item.failed) / item.total * 100).toFixed(1)) : 100, avgLatency: item.latencyCount ? Math.round(item.latencySum / item.latencyCount) : 0, cost: Number(item.cost.toFixed(4)) })).sort((a, b) => b.total - a.total),
     byPrompt: Object.values(byPrompt).sort((a, b) => b.calls - a.calls),
+    byPromptVersion: Object.values(byPromptVersion).map(item => ({ ...item, failureRate: item.calls ? Number((item.failed / item.calls * 100).toFixed(1)) : 0, retryRate: item.calls ? Number((item.retries / item.calls * 100).toFixed(1)) : 0, avgLatency: item.latencyCount ? Math.round(item.latencySum / item.latencyCount) : 0, cost: Number(item.cost.toFixed(4)) })).sort((a, b) => b.calls - a.calls),
     slowest: rows.filter(r => r.ok).sort((a, b) => Number(b.latencyMs || 0) - Number(a.latencyMs || 0)).slice(0, 10).map(r => ({ id: r.id, at: r.at, latencyMs: r.latencyMs, model: r.modelReturned || r.model, role: r.role, prompts: r.prompts || [], inputChars: r.inputChars, attempts: r.attempts })),
     filters: { models, prompts },
     settings: { inputPricePerM: settings.inputPricePerM, outputPricePerM: settings.outputPricePerM },
@@ -1047,6 +1064,7 @@ function assemblePromptConfig(selected, settings, variables = {}) {
       step: Number.isFinite(Number(p.step)) && p.step !== null ? Number(p.step) : null,
       stepKey: String(p.stepKey || 'extension').slice(0, 40),
       name: String(p.name || '自定义 Prompt').slice(0, 80),
+      version: String(p.version || 'unknown').slice(0, 40),
       content: content.slice(0, settings.promptMaxChars)
     };
   });

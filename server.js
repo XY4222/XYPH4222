@@ -64,6 +64,7 @@ function record(entry) {
     modelReturned: entry.modelReturned || null,
     role: entry.role || null,
     prompts: entry.prompts || [],
+    promptVersions: entry.promptVersions || [],
     riskHits: entry.riskHits || [],
     truncated: entry.truncated || [],
     dropped: entry.dropped || [],
@@ -96,6 +97,7 @@ async function handleAnalyze(req, res) {
   const started = Date.now();
   const settings = store.getSettings();
   let input = null;
+  let resolved = null;
 
   try {
     input = await readBody(req, BODY_LIMIT);
@@ -109,14 +111,14 @@ async function handleAnalyze(req, res) {
     }
 
     // Prompt 配置一律以服务端为准，前端不需要自己拼装，也就不会出现浏览器与服务端配置不一致
-    const resolved = store.buildPromptConfig(undefined, input);
+    resolved = store.buildPromptConfig(undefined, input);
     const payload = { ...input, promptConfig: resolved.config };
 
     const result = await analyzeResume(payload, { settings });
     const riskCheck = store.scanRisk(result.analysis?.finalResume);
     const runId = record({
       ok: true, modelReturned: result.model, usage: result.usage, latencyMs: Date.now() - started,
-      attempts: result.attempts, role: input.role, prompts: resolved.config.map(p => p.name),
+      attempts: result.attempts, role: input.role, prompts: resolved.config.map(p => p.name), promptVersions: resolved.config.map(p => ({ name: p.name, version: p.version })),
       truncated: resolved.truncated, dropped: resolved.dropped,
       riskHits: riskCheck.violations.map(item => item.ruleId),
       inputChars: String(input.jd || '').length + String(input.resume || '').length
@@ -128,7 +130,11 @@ async function handleAnalyze(req, res) {
   } catch (error) {
     const runId = record({
       ok: false, code: error.code || 'ANALYZE_FAILED', error: error.message || '分析失败',
-      latencyMs: Date.now() - started, attempts: error.attempts, role: input?.role, validationErrors: error.validationErrors || []
+      latencyMs: Date.now() - started, attempts: error.attempts, role: input?.role,
+      prompts: resolved?.config?.map(p => p.name) || [],
+      promptVersions: resolved?.config?.map(p => ({ name: p.name, version: p.version })) || [],
+      truncated: resolved?.truncated || [], dropped: resolved?.dropped || [],
+      validationErrors: error.validationErrors || []
     });
     const code = error.code || 'ANALYZE_FAILED';
     const degradation = degradationFor(code, error.retryAfter);
