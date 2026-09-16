@@ -49,7 +49,7 @@ async function readBody(req, limit) {
 /** 统一落盘一次调用结果；失败也要记录，否则失败率看板永远是 0。 */
 function record(entry) {
   const settings = store.getSettings();
-  store.appendLog({
+  return store.appendLog({
     at: new Date().toISOString(),
     model: entry.model || settings.model,
     ok: !!entry.ok,
@@ -89,7 +89,7 @@ async function handleAnalyze(req, res) {
     const payload = { ...input, promptConfig: resolved.config };
 
     const result = await analyzeResume(payload, { settings });
-    record({
+    const runId = record({
       ok: true, modelReturned: result.model, usage: result.usage, latencyMs: Date.now() - started,
       attempts: result.attempts, role: input.role, prompts: resolved.config.map(p => p.name),
       truncated: resolved.truncated, dropped: resolved.dropped,
@@ -97,14 +97,14 @@ async function handleAnalyze(req, res) {
     });
     return send(res, 200, {
       ...result,
-      promptConfig: { applied: resolved.config.length, truncated: resolved.truncated, dropped: resolved.dropped }
+      promptConfig: { applied: resolved.config.length, truncated: resolved.truncated, dropped: resolved.dropped }, runId
     });
   } catch (error) {
-    record({
+    const runId = record({
       ok: false, code: error.code || 'ANALYZE_FAILED', error: error.message || '分析失败',
       latencyMs: Date.now() - started, attempts: error.attempts, role: input?.role
     });
-    return send(res, error.statusCode || 500, { error: error.message || '分析失败', code: error.code || 'ANALYZE_FAILED' });
+    return send(res, error.statusCode || 500, { error: error.message || '分析失败', code: error.code || 'ANALYZE_FAILED', runId });
   }
 }
 
@@ -392,6 +392,23 @@ const routes = {
     items: store.listRegressions(url.searchParams.get('promptId'), Number(url.searchParams.get('limit') || 30))
   }),
 
+  'GET /api/feedback': (req, res, url) => send(res, 200, {
+    items: store.listFeedback({ status: url.searchParams.get('status') || undefined, rating: url.searchParams.get('rating') || undefined, prompt: url.searchParams.get('prompt') || undefined, limit: Number(url.searchParams.get('limit') || 200) }),
+    stats: store.feedbackStats()
+  }),
+
+  'POST /api/feedback': async (req, res) => {
+    const body = await readBody(req, ADMIN_LIMIT);
+    send(res, 201, { item: store.saveFeedback(body, req.auth.username) });
+  },
+
+  'PUT /api/feedback/:id': async (req, res, url, params) => {
+    const body = await readBody(req, ADMIN_LIMIT);
+    const item = store.updateFeedback(params.id, body, req.auth.username);
+    if (!item) return send(res, 404, { error: '质量反馈不存在', code: 'NOT_FOUND' });
+    send(res, 200, { item });
+  },
+
   'POST /api/logs/prune': (req, res) => send(res, 200, { kept: store.pruneLogs() }),
 
   'GET /api/settings': (req, res) => send(res, 200, { settings: store.getSettings() }),
@@ -416,6 +433,7 @@ function requiredRole(method, pathname) {
   if (method === 'POST' && /^\/api\/prompts\/[^/]+\/test$/.test(pathname)) return 'editor';
   if (method === 'POST' && /^\/api\/prompts\/[^/]+\/regression$/.test(pathname)) return 'editor';
   if (method === 'POST' && pathname === '/api/test-cases') return 'editor';
+  if ((method === 'POST' && pathname === '/api/feedback') || (method === 'PUT' && /^\/api\/feedback\/[^/]+$/.test(pathname))) return 'editor';
   return 'admin';
 }
 

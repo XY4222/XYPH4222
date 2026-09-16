@@ -11,6 +11,7 @@ const path = require('path');
  * data/test-cases.json —— 管理员显式保存的完整测试输入
  * data/prompt-tests.jsonl —— Prompt 测试运行指标，不保存简历原文
  * data/regressions.jsonl —— 回归门禁运行结果，不保存测试输入原文
+ * data/feedback.json —— 调用质量反馈，只保存评价元数据
  *
  * 原则：版本快照只追加、不覆盖。回滚是「以旧内容生成一个新版本」，不是删除历史。
  */
@@ -23,7 +24,8 @@ const FILES = {
   logs: path.join(DATA_DIR, 'logs.jsonl'),
   testCases: path.join(DATA_DIR, 'test-cases.json'),
   promptTests: path.join(DATA_DIR, 'prompt-tests.jsonl'),
-  regressions: path.join(DATA_DIR, 'regressions.jsonl')
+  regressions: path.join(DATA_DIR, 'regressions.jsonl'),
+  feedback: path.join(DATA_DIR, 'feedback.json')
 };
 
 const LOG_LIMIT = 5000;
@@ -78,6 +80,7 @@ function ensureData() {
   if (!fs.existsSync(FILES.testCases)) writeJson(FILES.testCases, []);
   if (!fs.existsSync(FILES.promptTests)) fs.writeFileSync(FILES.promptTests, '', 'utf8');
   if (!fs.existsSync(FILES.regressions)) fs.writeFileSync(FILES.regressions, '', 'utf8');
+  if (!fs.existsSync(FILES.feedback)) writeJson(FILES.feedback, []);
 
   // 兼容旧数据：升级前的每条记录都等同于已经在线生效的生产版本。
   const existing = readJson(FILES.prompts, []);
@@ -406,7 +409,7 @@ const ACTION_LABEL = {
   seed: '初始化', create: '新建', update: '修改内容', meta: '修改描述', scope: '调整归属步骤',
   status: '修改状态', enable: '启用', disable: '停用', rollback: '恢复为草稿', delete: '删除',
   submit_review: '提交审核', reject_review: '审核驳回', publish: '发布生产', production_rollback: '生产回滚',
-  test_case_create: '保存测试案例', test_case_delete: '删除测试案例'
+  test_case_create: '保存测试案例', test_case_delete: '删除测试案例', feedback_update: '更新质量反馈'
 };
 
 function pushAuditEvent(action, actor, subject, note) {
@@ -475,12 +478,14 @@ function saveSettings(patch, actor) {
 function appendLog(entry) {
   const safeEntry = { ...entry };
   if (!safeEntry.ok) safeEntry.error = ERROR_LABEL[safeEntry.code] || '调用失败';
-  const line = JSON.stringify({ id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`, ...safeEntry });
+  const row = { id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`, ...safeEntry };
+  const line = JSON.stringify(row);
   try {
     fs.appendFileSync(FILES.logs, line + '\n', 'utf8');
   } catch (error) {
     console.error(`[store] 写入日志失败：${error.message}`);
   }
+  return row.id;
 }
 
 function readLogs({ limit = 200, days = 0, ok, code, model, prompt, role, minLatency = 0 } = {}) {
@@ -504,6 +509,10 @@ function readLogs({ limit = 200, days = 0, ok, code, model, prompt, role, minLat
   }
   rows.sort((a, b) => new Date(b.at) - new Date(a.at));
   return { rows: rows.slice(0, limit), total: rows.length, settings };
+}
+
+function findLog(id) {
+  return readLogs({ limit: Number.MAX_SAFE_INTEGER }).rows.find(item => item.id === id) || null;
 }
 
 function pruneLogs() {
@@ -612,6 +621,75 @@ function logStats(days = 7, filters = {}) {
     settings: { inputPricePerM: settings.inputPricePerM, outputPricePerM: settings.outputPricePerM },
     days
   };
+}
+
+/* ---------- 质量反馈 ---------- */
+
+const FEEDBACK_STATUSES = new Set(['open', 'reviewing', 'resolved', 'dismissed']);
+const FEEDBACK_RATINGS = new Set(['good', 'bad']);
+
+function listFeedback({ status, rating, prompt, limit = 200 } = {}) {
+  return readJson(FILES.feedback, [])
+    .filter(item => !status || item.status === status)
+    .filter(item => !rating || item.rating === rating)
+    .filter(item => !prompt || (item.prompts || []).includes(prompt))
+    .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
+    .slice(0, Math.min(Math.max(Number(limit) || 200, 1), 500));
+}
+
+function saveFeedback(input, actor) {
+  const log = findLog(String(input.logId || ''));
+  if (!log) throw Object.assign(new Error('运行记录不存在'), { statusCode: 404, code: 'LOG_NOT_FOUND' });
+  if (!FEEDBACK_RATINGS.has(input.rating)) throw Object.assign(new Error('评价必须是 good 或 bad'), { statusCode: 400, code: 'INVALID_FEEDBACK_RATING' });
+  const all = readJson(FILES.feedback, []);
+  const now = new Date().toISOString();
+  let item = all.find(row => row.logId === log.id);
+  if (!item) {
+    item = { id: `fb-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`, logId: log.id, createdAt: now, createdBy: actor };
+    all.push(item);
+  }
+  Object.assign(item, {
+    rating: input.rating,
+    tags: Array.isArray(input.tags) ? input.tags.map(tag => clip(tag, 40).trim()).filter(Boolean).slice(0, 20) : [],
+    comment: clip(input.comment, 1000).trim(),
+    status: FEEDBACK_STATUSES.has(input.status) ? input.status : 'open',
+    owner: clip(input.owner, 80).trim(),
+    model: log.modelReturned || log.model || null,
+    role: log.role || null,
+    prompts: log.prompts || [],
+    runAt: log.at,
+    updatedAt: now,
+    updatedBy: actor
+  });
+  writeJson(FILES.feedback, all);
+  pushAuditEvent('feedback_update', actor, `质量反馈：${item.id}`, `${item.rating}/${item.status}，运行记录 ${item.logId}`);
+  return item;
+}
+
+function updateFeedback(id, input, actor) {
+  const all = readJson(FILES.feedback, []);
+  const item = all.find(row => row.id === id);
+  if (!item) return null;
+  if (input.status !== undefined && !FEEDBACK_STATUSES.has(input.status)) throw Object.assign(new Error('反馈状态无效'), { statusCode: 400, code: 'INVALID_FEEDBACK_STATUS' });
+  if (input.rating !== undefined && !FEEDBACK_RATINGS.has(input.rating)) throw Object.assign(new Error('反馈评价无效'), { statusCode: 400, code: 'INVALID_FEEDBACK_RATING' });
+  if (input.status !== undefined) item.status = input.status;
+  if (input.rating !== undefined) item.rating = input.rating;
+  if (input.tags !== undefined) item.tags = Array.isArray(input.tags) ? input.tags.map(tag => clip(tag, 40).trim()).filter(Boolean).slice(0, 20) : [];
+  if (input.comment !== undefined) item.comment = clip(input.comment, 1000).trim();
+  if (input.owner !== undefined) item.owner = clip(input.owner, 80).trim();
+  item.updatedAt = new Date().toISOString(); item.updatedBy = actor;
+  writeJson(FILES.feedback, all);
+  pushAuditEvent('feedback_update', actor, `质量反馈：${item.id}`, `${item.rating}/${item.status}，运行记录 ${item.logId}`);
+  return item;
+}
+
+function feedbackStats() {
+  const items = readJson(FILES.feedback, []);
+  const byTag = {};
+  for (const item of items) for (const tag of item.tags || []) byTag[tag] = (byTag[tag] || 0) + 1;
+  const good = items.filter(item => item.rating === 'good').length;
+  const bad = items.filter(item => item.rating === 'bad').length;
+  return { total: items.length, good, bad, positiveRate: items.length ? Number((good / items.length * 100).toFixed(1)) : 0, open: items.filter(item => ['open', 'reviewing'].includes(item.status)).length, resolved: items.filter(item => item.status === 'resolved').length, byTag: Object.entries(byTag).map(([tag, count]) => ({ tag, count })).sort((a, b) => b.count - a.count) };
 }
 
 /* ---------- Prompt 测试台 ---------- */
@@ -820,5 +898,6 @@ module.exports = {
   getSettings, saveSettings, appendLog, readLogs, pruneLogs, logStats, buildPromptConfig,
   listTestCases, createTestCase, removeTestCase, appendPromptTest, listPromptTests, buildPromptConfigForTest,
   regressionSuiteKey, appendRegression, listRegressions,
+  findLog, listFeedback, saveFeedback, updateFeedback, feedbackStats,
   overview, costOf, bumpVersion
 };
