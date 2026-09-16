@@ -22,8 +22,9 @@
     settings: null,
     testCases: [],
     testRuns: [],
+    regressionRuns: [],
     testResult: null,
-    testForm: { promptId: '', caseId: '', name: '', role: '', jd: '', resume: '', extra: '' },
+    testForm: { promptId: '', caseId: '', name: '', role: '', jd: '', resume: '', extra: '', minScore: '0', maxScoreDrop: '5', requiredTerms: '' },
     currentPrompt: null,
     currentVersions: []
   };
@@ -249,7 +250,7 @@
   function loading(text) { return `<div class="panel"><div class="loading">${escapeHtml(text || '加载中…')}</div></div>`; }
 
   function captureTestForm() {
-    const fields = ['promptId', 'caseId', 'name', 'role', 'jd', 'resume', 'extra'];
+    const fields = ['promptId', 'caseId', 'name', 'role', 'jd', 'resume', 'extra', 'minScore', 'maxScoreDrop', 'requiredTerms'];
     fields.forEach(key => {
       const el = $('#test-' + key);
       if (el) state.testForm[key] = el.value;
@@ -289,15 +290,18 @@
       <div class="item"><label>草稿耗时差</label><strong>${result.comparison.latencyDeltaMs == null ? '不可比较' : `${Number(result.comparison.latencyDeltaMs) >= 0 ? '+' : ''}${fmtLatency(result.comparison.latencyDeltaMs)}`}</strong></div>
       <div class="item"><label>草稿成本差</label><strong>${result.comparison.costDelta == null ? '不可比较' : `${Number(result.comparison.costDelta) >= 0 ? '+' : ''}¥${fmtCost(result.comparison.costDelta)}`}</strong></div>
     </div></div>` : '';
-    const cases = state.testCases.length ? state.testCases.map(item => `<div class="case-row"><div class="case-main"><div class="prompt-name">${escapeHtml(item.name)}</div><div class="prompt-meta">${escapeHtml(item.role)} · ${escapeHtml(item.createdBy)} · ${fullTime(item.updatedAt)}</div></div><button class="iconbtn" data-testcase-load="${escapeHtml(item.id)}">载入</button>${can('admin') ? `<button class="iconbtn danger-text" data-testcase-delete="${escapeHtml(item.id)}">删除</button>` : ''}</div>`).join('') : '<div class="empty">尚未保存测试案例</div>';
+    const cases = state.testCases.length ? state.testCases.map(item => `<div class="case-row"><div class="case-main"><div class="prompt-name">${escapeHtml(item.name)}</div><div class="prompt-meta">${escapeHtml(item.role)} · 最低分 ${item.minScore || 0} · 最大降分 ${item.maxScoreDrop ?? 5} · ${escapeHtml(item.createdBy)} · ${fullTime(item.updatedAt)}</div></div><button class="iconbtn" data-testcase-load="${escapeHtml(item.id)}">载入</button>${can('admin') ? `<button class="iconbtn danger-text" data-testcase-delete="${escapeHtml(item.id)}">删除</button>` : ''}</div>`).join('') : '<div class="empty">尚未保存测试案例</div>';
     const runs = state.testRuns.length ? `<table class="table"><thead><tr><th>时间</th><th>Prompt</th><th>版本</th><th>状态</th><th>岗位</th><th>模型</th><th>耗时</th><th>Token</th><th>成本</th></tr></thead><tbody>${state.testRuns.map(run => `<tr><td class="prompt-meta">${fullTime(run.at)}</td><td>${escapeHtml(run.promptName)}</td><td>${tag(run.variant === 'draft' ? '草稿' : '生产', run.variant === 'draft' ? 'blue' : 'green')}</td><td><span class="run-status ${run.ok ? 'ok' : 'fail'}">${run.ok ? '成功' : escapeHtml(run.code || '失败')}</span></td><td>${escapeHtml(run.role || '-')}</td><td>${escapeHtml(run.model || '-')}</td><td>${fmtLatency(run.latencyMs)}</td><td>${fmtNumber(run.usage && run.usage.total_tokens)}</td><td>¥${fmtCost(run.cost)}</td></tr>`).join('')}</tbody></table>` : '<div class="empty">尚无测试运行记录</div>';
+    const latestRegression = state.regressionRuns.find(run => String(run.promptId) === String(f.promptId));
+    const regressionPanel = `<section class="panel"><div class="panel-head"><div><h2>发布回归门禁</h2><p>当前 Prompt 的全部案例通过后，当前草稿修订才可提交审核或发布</p></div>${can('editor') ? '<button class="primary" id="runRegression">运行回归测试集</button>' : ''}</div>${latestRegression ? `<div style="padding:18px"><div class="kv"><div class="item"><label>最近结果</label><strong class="run-status ${latestRegression.passed ? 'ok' : 'fail'}">${latestRegression.passed ? '通过' : '未通过'}</strong></div><div class="item"><label>测试版本</label><strong>${escapeHtml(latestRegression.promptVersion)}</strong></div><div class="item"><label>案例</label><strong>${latestRegression.total} 个 / 失败 ${latestRegression.failed}</strong></div><div class="item"><label>运行时间</label><strong>${fullTime(latestRegression.at)}</strong></div></div>${latestRegression.results.map(item => `<div class="case-row" style="margin-top:10px"><div class="case-main"><div class="prompt-name">${escapeHtml(item.caseName)}</div><div class="prompt-meta">草稿分 ${item.draft.score ?? '-'} · 生产分 ${item.published.score ?? '-'}${item.missingTerms.length ? ` · 缺少词：${escapeHtml(item.missingTerms.join('、'))}` : ''}</div></div>${tag(item.passed ? '通过' : '失败', item.passed ? 'green' : 'red')}</div>`).join('')}</div>` : '<div class="empty">当前 Prompt 尚无回归运行记录</div>'}</section>`;
     return `<div class="headline"><div><h1>Prompt 测试台</h1><p>用同一份输入对比当前生产快照与工作草稿；测试不会发布或改写任何 Prompt。</p></div><button class="secondary" id="reloadTests">刷新数据</button></div>
       <section class="panel"><div class="panel-head"><div><h2>测试输入</h2><p>普通试运行只记录字符数与性能指标，不保存 JD 和简历原文</p></div></div><div class="test-form">
-        <div class="grid2"><div class="field"><label>目标 Prompt</label><select id="test-promptId" required>${promptOptions}</select></div><div class="field"><label>载入已保存案例</label><select id="test-caseId"><option value="">不载入</option>${caseOptions}</select></div><div class="field"><label>案例名称</label><input id="test-name" value="${escapeHtml(f.name)}" placeholder="例如：AI 产品经理 5 年经验" /></div><div class="field"><label>目标岗位</label><input id="test-role" value="${escapeHtml(f.role)}" placeholder="必填" /></div></div>
-        <div class="field"><label>职位描述 JD</label><textarea id="test-jd" placeholder="必填">${escapeHtml(f.jd)}</textarea></div><div class="field"><label>测试简历</label><textarea id="test-resume" placeholder="必填">${escapeHtml(f.resume)}</textarea></div><div class="field"><label>补充信息</label><textarea id="test-extra" style="min-height:90px">${escapeHtml(f.extra)}</textarea></div>
+        <div class="grid2"><div class="field"><label>目标 Prompt</label><select id="test-promptId" required>${promptOptions}</select></div><div class="field"><label>载入已保存案例</label><select id="test-caseId"><option value="">不载入</option>${caseOptions}</select></div><div class="field"><label>案例名称</label><input id="test-name" value="${escapeHtml(f.name)}" placeholder="例如：AI 产品经理 5 年经验" /></div><div class="field"><label>目标岗位</label><input id="test-role" value="${escapeHtml(f.role)}" placeholder="必填" /></div><div class="field"><label>最低草稿分数</label><input id="test-minScore" type="number" min="0" max="100" value="${escapeHtml(f.minScore)}" /></div><div class="field"><label>相对生产最大允许降分</label><input id="test-maxScoreDrop" type="number" min="0" max="100" value="${escapeHtml(f.maxScoreDrop)}" /></div></div>
+        <div class="field"><label>职位描述 JD</label><textarea id="test-jd" placeholder="必填">${escapeHtml(f.jd)}</textarea></div><div class="field"><label>测试简历</label><textarea id="test-resume" placeholder="必填">${escapeHtml(f.resume)}</textarea></div><div class="field"><label>补充信息</label><textarea id="test-extra" style="min-height:90px">${escapeHtml(f.extra)}</textarea></div><div class="field"><label>优化后简历必含词（逗号或换行分隔）</label><input id="test-requiredTerms" value="${escapeHtml(f.requiredTerms)}" /></div>
         ${can('editor') ? `<div class="test-actions"><span class="privacy-note">保存为案例会把完整 JD、简历和补充信息持久化到服务端（JD/简历各最多 120000 字符）；普通试运行不会保存原文。</span><button class="secondary" id="saveTestCase">保存为测试案例</button><button class="primary" id="runPromptTest">对比草稿与生产</button></div>` : '<div class="banner warn show">当前为查看者权限：可以查看案例与运行记录，但不能运行测试或保存输入。</div>'}
       </div></section>
       ${result ? `<section class="panel"><div class="panel-head"><div><h2>本次对比结果</h2><p>${escapeHtml(result.prompt && result.prompt.name || '')}</p></div></div><div class="result-grid">${testResultCard('生产版本', result.results && result.results.published)}${testResultCard('工作草稿', result.results && result.results.draft)}</div>${comparison}</section>` : ''}
+      ${regressionPanel}
       <section class="grid2"><div class="panel"><div class="panel-head"><div><h2>已保存测试案例</h2><p>这里包含完整测试输入，请按敏感数据管理</p></div></div><div class="case-list">${cases}</div></div><div class="panel"><div class="panel-head"><div><h2>最近运行</h2><p>仅保存指标和错误，不保存输入原文</p></div></div>${runs}</div></section>`;
   }
 
@@ -867,9 +871,10 @@
   async function loadTests() {
     try {
       if (!state.prompts.length) await refreshPrompts();
-      const [cases, runs] = await Promise.all([api('/api/test-cases'), api('/api/prompt-tests?limit=50')]);
+      const [cases, runs, regressions] = await Promise.all([api('/api/test-cases'), api('/api/prompt-tests?limit=50'), api('/api/regressions?limit=30')]);
       state.testCases = cases.items || [];
       state.testRuns = runs.items || [];
+      state.regressionRuns = regressions.items || [];
       if (!state.testForm.promptId && state.prompts.length) state.testForm.promptId = String(state.prompts[0].id);
       clearConnError();
       render();
@@ -910,7 +915,9 @@
       if (!selected) return;
       state.testForm = {
         ...state.testForm, caseId: selected.id, name: selected.name, role: selected.role,
-        jd: selected.jd, resume: selected.resume, extra: selected.extra || ''
+        promptId: selected.promptId || state.testForm.promptId, jd: selected.jd, resume: selected.resume, extra: selected.extra || '',
+        minScore: String(selected.minScore || 0), maxScoreDrop: String(selected.maxScoreDrop ?? 5),
+        requiredTerms: (selected.requiredTerms || []).join('、')
       };
       render();
     };
@@ -964,6 +971,21 @@
         const runs = await api('/api/prompt-tests?limit=50');
         state.testRuns = runs.items || [];
       } catch (error) { showConnError(`测试记录刷新失败：${error.message}`); }
+      render();
+    });
+    const promptSelect = $('#test-promptId');
+    if (promptSelect) promptSelect.addEventListener('change', () => { captureTestForm(); render(); });
+    const runRegression = $('#runRegression');
+    if (runRegression) runRegression.addEventListener('click', async () => {
+      const form = captureTestForm();
+      if (!form.promptId) return toast('请选择目标 Prompt', true);
+      runRegression.disabled = true;
+      runRegression.textContent = '回归运行中…';
+      try {
+        const data = await api(`/api/prompts/${encodeURIComponent(form.promptId)}/regression`, { method: 'POST', body: {} });
+        state.regressionRuns = [data.run, ...state.regressionRuns.filter(item => item.id !== data.run.id)];
+        toast(data.run.passed ? '回归门禁通过' : `回归门禁未通过：${data.run.failed} 个案例失败`, !data.run.passed);
+      } catch (error) { toast(error.message, true); }
       render();
     });
     const reloadTests = $('#reloadTests');

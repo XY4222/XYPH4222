@@ -198,6 +198,50 @@ async function handlePromptTest(req, res, promptId) {
   return send(res, status, { prompt: store.summarize(prompt), results, comparison });
 }
 
+async function handleRegression(req, res, promptId) {
+  await readBody(req, ADMIN_LIMIT);
+  const prompt = store.getPrompt(promptId);
+  if (!prompt) return send(res, 404, { error: 'Prompt 不存在', code: 'NOT_FOUND' });
+  const cases = store.listTestCases(promptId);
+  if (!cases.length) return send(res, 409, { error: '该 Prompt 尚未配置回归测试案例', code: 'NO_REGRESSION_CASES' });
+  const results = [];
+  for (const testCase of cases) {
+    const input = { role: testCase.role, jd: testCase.jd, resume: testCase.resume, extra: testCase.extra || '' };
+    const sideResults = {};
+    for (const variant of ['published', 'draft']) {
+      const started = Date.now();
+      try {
+        const resolved = store.buildPromptConfigForTest(promptId, variant);
+        const modelResult = process.env.NODE_ENV === 'test' && process.env.PROMPT_TEST_MOCK === 'true'
+          ? mockPromptTestResult(variant, resolved)
+          : await analyzeResume({ ...input, promptConfig: resolved.config }, { settings: store.getSettings() });
+        sideResults[variant] = { ok: true, score: Number(modelResult.analysis?.score || 0), finalResume: modelResult.analysis?.finalResume || '', latencyMs: Date.now() - started };
+      } catch (error) {
+        sideResults[variant] = { ok: false, code: error.code || 'PROMPT_TEST_FAILED', error: error.message, latencyMs: Date.now() - started };
+      }
+    }
+    const draft = sideResults.draft;
+    const published = sideResults.published;
+    const scoreDrop = draft.ok && published.ok ? published.score - draft.score : null;
+    const missingTerms = draft.ok ? testCase.requiredTerms.filter(term => !draft.finalResume.includes(term)) : testCase.requiredTerms;
+    const comparableOrNew = published.ok || published.code === 'NO_PUBLISHED_VERSION';
+    const passed = draft.ok && comparableOrNew && draft.score >= testCase.minScore
+      && (!published.ok || scoreDrop <= testCase.maxScoreDrop) && missingTerms.length === 0;
+    results.push({
+      caseId: testCase.id, caseName: testCase.name, passed, minScore: testCase.minScore,
+      maxScoreDrop: testCase.maxScoreDrop, requiredTerms: testCase.requiredTerms, missingTerms,
+      published: { ok: published.ok, score: published.score, code: published.code, latencyMs: published.latencyMs },
+      draft: { ok: draft.ok, score: draft.score, code: draft.code, latencyMs: draft.latencyMs }, scoreDrop
+    });
+  }
+  const run = store.appendRegression({
+    promptId: prompt.id, promptName: prompt.name, promptVersion: prompt.version, promptRevision: prompt.revision,
+    suiteKey: store.regressionSuiteKey(prompt.id), passed: results.every(item => item.passed),
+    total: results.length, failed: results.filter(item => !item.passed).length, actor: req.auth.username, results
+  });
+  return send(res, 200, { run });
+}
+
 const routes = {
   'GET /api/health': (req, res) => send(res, 200, { ok: true, at: new Date().toISOString() }),
 
@@ -285,6 +329,7 @@ const routes = {
   },
 
   'POST /api/prompts/:id/test': async (req, res, url, params) => handlePromptTest(req, res, params.id),
+  'POST /api/prompts/:id/regression': async (req, res, url, params) => handleRegression(req, res, params.id),
 
   'DELETE /api/prompts/:id': (req, res, url, params) => {
     if (!store.removePrompt(params.id, req.auth.username)) return send(res, 404, { error: 'Prompt 不存在' });
@@ -298,7 +343,7 @@ const routes = {
   'GET /api/changes': (req, res, url) => {
     const items = store.listChanges(Number(url.searchParams.get('limit') || 100)).map(v => ({
       ...v,
-      promptName: v.promptId ? (store.getPrompt(v.promptId)?.name || '已删除的 Prompt') : '运行参数'
+      promptName: v.promptName || (v.promptId ? (store.getPrompt(v.promptId)?.name || '已删除的 Prompt') : '运行参数')
     }));
     send(res, 200, { items });
   },
@@ -319,7 +364,7 @@ const routes = {
 
   'GET /api/logs/stats': (req, res, url) => send(res, 200, store.logStats(Number(url.searchParams.get('days') || 7))),
 
-  'GET /api/test-cases': (req, res) => send(res, 200, { items: store.listTestCases() }),
+  'GET /api/test-cases': (req, res, url) => send(res, 200, { items: store.listTestCases(url.searchParams.get('promptId')) }),
 
   'POST /api/test-cases': async (req, res) => {
     const body = await readBody(req, ADMIN_LIMIT);
@@ -333,6 +378,9 @@ const routes = {
 
   'GET /api/prompt-tests': (req, res, url) => send(res, 200, {
     items: store.listPromptTests(url.searchParams.get('promptId'), Number(url.searchParams.get('limit') || 50))
+  }),
+  'GET /api/regressions': (req, res, url) => send(res, 200, {
+    items: store.listRegressions(url.searchParams.get('promptId'), Number(url.searchParams.get('limit') || 30))
   }),
 
   'POST /api/logs/prune': (req, res) => send(res, 200, { kept: store.pruneLogs() }),
@@ -357,6 +405,7 @@ function requiredRole(method, pathname) {
   if (method === 'PUT' && /^\/api\/prompts\/[^/]+$/.test(pathname)) return 'editor';
   if (method === 'POST' && /^\/api\/prompts\/[^/]+\/(toggle|rollback|submit-review)$/.test(pathname)) return 'editor';
   if (method === 'POST' && /^\/api\/prompts\/[^/]+\/test$/.test(pathname)) return 'editor';
+  if (method === 'POST' && /^\/api\/prompts\/[^/]+\/regression$/.test(pathname)) return 'editor';
   if (method === 'POST' && pathname === '/api/test-cases') return 'editor';
   return 'admin';
 }

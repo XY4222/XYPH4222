@@ -10,6 +10,7 @@ const path = require('path');
  * data/logs.jsonl     —— 每次 /api/analyze 调用一行，追加写入
  * data/test-cases.json —— 管理员显式保存的完整测试输入
  * data/prompt-tests.jsonl —— Prompt 测试运行指标，不保存简历原文
+ * data/regressions.jsonl —— 回归门禁运行结果，不保存测试输入原文
  *
  * 原则：版本快照只追加、不覆盖。回滚是「以旧内容生成一个新版本」，不是删除历史。
  */
@@ -21,7 +22,8 @@ const FILES = {
   settings: path.join(DATA_DIR, 'settings.json'),
   logs: path.join(DATA_DIR, 'logs.jsonl'),
   testCases: path.join(DATA_DIR, 'test-cases.json'),
-  promptTests: path.join(DATA_DIR, 'prompt-tests.jsonl')
+  promptTests: path.join(DATA_DIR, 'prompt-tests.jsonl'),
+  regressions: path.join(DATA_DIR, 'regressions.jsonl')
 };
 
 const LOG_LIMIT = 5000;
@@ -75,6 +77,7 @@ function ensureData() {
   if (!fs.existsSync(FILES.logs)) fs.writeFileSync(FILES.logs, '', 'utf8');
   if (!fs.existsSync(FILES.testCases)) writeJson(FILES.testCases, []);
   if (!fs.existsSync(FILES.promptTests)) fs.writeFileSync(FILES.promptTests, '', 'utf8');
+  if (!fs.existsSync(FILES.regressions)) fs.writeFileSync(FILES.regressions, '', 'utf8');
 
   // 兼容旧数据：升级前的每条记录都等同于已经在线生效的生产版本。
   const existing = readJson(FILES.prompts, []);
@@ -321,6 +324,7 @@ function submitPromptReview(id, input = {}) {
   if (prompt.releaseStatus === 'published') {
     throw Object.assign(new Error('当前没有待审核的草稿'), { statusCode: 409, code: 'NO_DRAFT' });
   }
+  assertRegressionGate(prompt);
   prompt.releaseStatus = 'review';
   prompt.reviewNote = clip(input.note, 200);
   prompt.updatedAt = new Date().toISOString();
@@ -356,6 +360,7 @@ function publishPrompt(id, input = {}) {
   if (!String(prompt.content || '').trim()) {
     throw Object.assign(new Error('Prompt 内容为空，不能发布'), { statusCode: 400, code: 'EMPTY_PROMPT' });
   }
+  assertRegressionGate(prompt);
   prompt.publishedSnapshot = snapshotOf(prompt);
   prompt.publishedVersion = prompt.version;
   prompt.publishedAt = new Date().toISOString();
@@ -574,8 +579,10 @@ function logStats(days = 7) {
 
 /* ---------- Prompt 测试台 ---------- */
 
-function listTestCases() {
-  return readJson(FILES.testCases, []).sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+function listTestCases(promptId) {
+  return readJson(FILES.testCases, [])
+    .filter(item => !promptId || String(item.promptId || '') === String(promptId))
+    .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
 }
 
 function createTestCase(input, actor) {
@@ -586,6 +593,8 @@ function createTestCase(input, actor) {
   const jd = String(input.jd ?? '').trim();
   const resume = String(input.resume ?? '').trim();
   const extra = String(input.extra ?? '').trim();
+  const minScore = Number(input.minScore);
+  const maxScoreDrop = Number(input.maxScoreDrop);
   if (jd.length > TEST_INPUT_MAX || resume.length > TEST_INPUT_MAX || extra.length > 10000) {
     throw Object.assign(new Error('测试案例输入过长：JD/简历各最多 120000 字符，补充信息最多 10000 字符'), {
       statusCode: 413, code: 'TEST_CASE_TOO_LARGE'
@@ -594,10 +603,14 @@ function createTestCase(input, actor) {
   const testCase = {
     id: `case-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
     name: clip(input.name, 100) || `测试案例 ${cases.length + 1}`,
+    promptId: input.promptId === undefined || input.promptId === null ? null : String(input.promptId),
     role: clip(role, 100),
     jd,
     resume,
     extra,
+    minScore: Math.min(Math.max(Number.isFinite(minScore) ? minScore : 0, 0), 100),
+    maxScoreDrop: Math.min(Math.max(Number.isFinite(maxScoreDrop) ? maxScoreDrop : 5, 0), 100),
+    requiredTerms: String(input.requiredTerms || '').split(/[,，、\n]/).map(item => item.trim()).filter(Boolean).slice(0, 30),
     createdBy: clip(actor || '管理员', 80),
     createdAt: now,
     updatedAt: now
@@ -643,6 +656,42 @@ function listPromptTests(promptId, limit = 50) {
     } catch { /* 跳过损坏行 */ }
   }
   return rows.sort((a, b) => new Date(b.at) - new Date(a.at)).slice(0, Math.min(Math.max(Number(limit) || 50, 1), 200));
+}
+
+function regressionSuiteKey(promptId) {
+  return listTestCases(promptId).map(item => `${item.id}:${item.updatedAt}`).sort().join('|');
+}
+
+function appendRegression(entry) {
+  const row = { id: `reg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`, at: new Date().toISOString(), ...entry };
+  fs.appendFileSync(FILES.regressions, JSON.stringify(row) + '\n', 'utf8');
+  return row;
+}
+
+function listRegressions(promptId, limit = 30) {
+  const raw = fs.existsSync(FILES.regressions) ? fs.readFileSync(FILES.regressions, 'utf8') : '';
+  const rows = [];
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const row = JSON.parse(line);
+      if (promptId && String(row.promptId) !== String(promptId)) continue;
+      rows.push(row);
+    } catch { /* 跳过损坏行 */ }
+  }
+  return rows.sort((a, b) => new Date(b.at) - new Date(a.at)).slice(0, Math.min(Math.max(Number(limit) || 30, 1), 100));
+}
+
+function assertRegressionGate(prompt) {
+  const cases = listTestCases(prompt.id);
+  if (!cases.length) return;
+  const latest = listRegressions(prompt.id, 1)[0];
+  const currentSuite = regressionSuiteKey(prompt.id);
+  if (!latest || !latest.passed || Number(latest.promptRevision) !== Number(prompt.revision) || latest.suiteKey !== currentSuite) {
+    throw Object.assign(new Error('当前草稿尚未通过最新回归测试集，不能提交审核或发布'), {
+      statusCode: 409, code: 'REGRESSION_GATE_FAILED'
+    });
+  }
 }
 
 /* ---------- 供分析链路使用 ---------- */
@@ -733,5 +782,6 @@ module.exports = {
   listVersions, getVersion, listChanges, changesInLastDays,
   getSettings, saveSettings, appendLog, readLogs, pruneLogs, logStats, buildPromptConfig,
   listTestCases, createTestCase, removeTestCase, appendPromptTest, listPromptTests, buildPromptConfigForTest,
+  regressionSuiteKey, appendRegression, listRegressions,
   overview, costOf, bumpVersion
 };
