@@ -93,9 +93,15 @@ function parseModelJson(content) {
   let parsed;
   try { parsed = JSON.parse(clean); }
   catch { throw Object.assign(new Error('DeepSeek 返回的 JSON 不完整'), { code: 'INVALID_MODEL_JSON' }); }
-  if (!Array.isArray(parsed.duties) || !Array.isArray(parsed.matches) || !parsed.finalResume) {
-    throw Object.assign(new Error('模型返回结构不完整，缺少 duties / matches / finalResume'), { code: 'INVALID_MODEL_JSON' });
-  }
+  const errors = [];
+  const list = (key, min, max) => { const a = parsed[key]; if (!Array.isArray(a) || a.length < min || a.length > max || a.some(v => typeof v !== 'string' || !v.trim())) errors.push(key); };
+  const rows = (key, min, max, width) => { const a = parsed[key]; if (!Array.isArray(a) || a.length < min || a.length > max || a.some(row => !Array.isArray(row) || row.length !== width)) errors.push(key); };
+  if (!Number.isInteger(parsed.score) || parsed.score < 0 || parsed.score > 100) errors.push('score');
+  ['scoreSummary', 'scoreDescription', 'highestRisk', 'finalResume', 'intro'].forEach(key => { if (typeof parsed[key] !== 'string' || !parsed[key].trim()) errors.push(key); });
+  list('duties', 4, 6); list('hard', 4, 6); list('implicit', 3, 5); list('ideal', 3, 5); list('keywords', 8, 14); list('evidenceToPrepare', 4, 6); list('dataGaps', 4, 6);
+  rows('capabilities', 1, 12, 3); rows('dimensions', 6, 6, 2); rows('issues', 1, 12, 4); rows('matches', 6, 10, 5); rows('questions', 5, 10, 2); rows('comparisons', 4, 8, 5); rows('interview', 10, 10, 2);
+  if (Array.isArray(parsed.dimensions) && parsed.dimensions.some(row => !Array.isArray(row) || !Number.isInteger(row[1]) || row[1] < 0 || row[1] > 100)) errors.push('dimensions.score');
+  if (errors.length) throw Object.assign(new Error('模型返回结构校验失败：' + errors.slice(0, 4).join('、')), { code: 'INVALID_MODEL_SCHEMA' });
   return parsed;
 }
 
@@ -110,6 +116,7 @@ function degradationFor(code, retryAfter) {
     MODEL_REQUEST_REJECTED: { state: 'request_rejected', retryable: false, message: '模型服务拒绝了本次请求，请联系管理员检查配置' },
     EMPTY_MODEL_OUTPUT: { state: 'invalid_response', retryable: true, message: '模型未返回有效结果，可重试' },
     INVALID_MODEL_JSON: { state: 'invalid_response', retryable: true, message: '模型返回内容不完整，可重试' },
+    INVALID_MODEL_SCHEMA: { state: 'invalid_response', retryable: true, message: '模型返回结构不符合要求，可重试' },
     BAD_REQUEST: { state: 'invalid_request', retryable: false, message: '请补全目标岗位、JD 和原始简历' },
     PAYLOAD_TOO_LARGE: { state: 'invalid_request', retryable: false, message: '输入内容超过允许长度，请精简后重试' }
   };
@@ -189,7 +196,7 @@ async function handleAnalyze(request, env) {
       lastError = error;
       if (error.name === 'TimeoutError' || error.name === 'AbortError') lastError = Object.assign(new Error('DeepSeek 单次分析超时'), { code: 'UPSTREAM_TIMEOUT' });
       else if (error instanceof TypeError && !error.code) lastError = Object.assign(new Error('DeepSeek 模型服务暂时不可用'), { code: 'MODEL_UNAVAILABLE' });
-      const retryable = ['EMPTY_MODEL_OUTPUT', 'INVALID_MODEL_JSON', 'RATE_LIMIT', 'MODEL_UNAVAILABLE', 'UPSTREAM_TIMEOUT'].includes(lastError.code);
+      const retryable = ['EMPTY_MODEL_OUTPUT', 'INVALID_MODEL_JSON', 'INVALID_MODEL_SCHEMA', 'RATE_LIMIT', 'MODEL_UNAVAILABLE', 'UPSTREAM_TIMEOUT'].includes(lastError.code);
       if (!retryable || attempt === retries) break;
       const backoff = lastError.retryAfter ? Math.min(lastError.retryAfter * 1000, 8000) : Math.min(400 * Math.pow(2, attempt), 4000);
       await new Promise(resolve => setTimeout(resolve, backoff));

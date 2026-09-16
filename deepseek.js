@@ -88,13 +88,34 @@ function parseModelJson(content) {
   let parsed;
   try { parsed = JSON.parse(clean); }
   catch { throw Object.assign(new Error('DeepSeek 返回的 JSON 不完整'), { code: 'INVALID_MODEL_JSON' }); }
-  if (!Array.isArray(parsed.duties) || !Array.isArray(parsed.matches) || !parsed.finalResume) {
-    throw Object.assign(new Error('模型返回结构不完整，缺少 duties / matches / finalResume'), { code: 'INVALID_MODEL_JSON' });
-  }
-  return parsed;
+  return validateAnalysisSchema(parsed);
 }
 
-const RETRYABLE = ['EMPTY_MODEL_OUTPUT', 'INVALID_MODEL_JSON', 'UPSTREAM_TIMEOUT', 'RATE_LIMIT', 'MODEL_UNAVAILABLE'];
+function validateAnalysisSchema(value) {
+  const errors = [];
+  const text = (key) => { if (typeof value?.[key] !== 'string' || !value[key].trim()) errors.push(`${key} 必须是非空文本`); };
+  const list = (key, min, max) => {
+    const item = value?.[key];
+    if (!Array.isArray(item) || item.length < min || item.length > max || item.some(v => typeof v !== 'string' || !v.trim())) errors.push(`${key} 必须包含 ${min}-${max} 条非空文本`);
+  };
+  const rows = (key, min, max, width) => {
+    const item = value?.[key];
+    if (!Array.isArray(item) || item.length < min || item.length > max || item.some(row => !Array.isArray(row) || row.length !== width)) errors.push(`${key} 必须包含 ${min}-${max} 行，每行 ${width} 列`);
+  };
+  if (!Number.isInteger(value?.score) || value.score < 0 || value.score > 100) errors.push('score 必须是 0-100 整数');
+  ['scoreSummary', 'scoreDescription', 'highestRisk', 'finalResume', 'intro'].forEach(text);
+  list('duties', 4, 6); list('hard', 4, 6); list('implicit', 3, 5); list('ideal', 3, 5); list('keywords', 8, 14);
+  list('evidenceToPrepare', 4, 6); list('dataGaps', 4, 6);
+  rows('capabilities', 1, 12, 3); rows('dimensions', 6, 6, 2); rows('issues', 1, 12, 4);
+  rows('matches', 6, 10, 5); rows('questions', 5, 10, 2); rows('comparisons', 4, 8, 5); rows('interview', 10, 10, 2);
+  if (Array.isArray(value?.dimensions) && value.dimensions.some(row => !Array.isArray(row) || !Number.isInteger(row[1]) || row[1] < 0 || row[1] > 100)) errors.push('dimensions 分数必须是 0-100 整数');
+  if (Array.isArray(value?.issues) && value.issues.some(row => !['P0', 'P1', 'P2'].includes(row?.[0]) || !['red', 'amber', 'blue'].includes(row?.[3]))) errors.push('issues 优先级或颜色无效');
+  if (Array.isArray(value?.matches) && value.matches.some(row => !['强', '中', '弱', '无'].includes(row?.[2]) || !['是', '否'].includes(row?.[3]))) errors.push('matches 证据强度或补充标记无效');
+  if (errors.length) throw Object.assign(new Error(`模型返回结构校验失败：${errors.slice(0, 4).join('；')}`), { code: 'INVALID_MODEL_SCHEMA', validationErrors: errors });
+  return value;
+}
+
+const RETRYABLE = ['EMPTY_MODEL_OUTPUT', 'INVALID_MODEL_JSON', 'INVALID_MODEL_SCHEMA', 'UPSTREAM_TIMEOUT', 'RATE_LIMIT', 'MODEL_UNAVAILABLE'];
 
 function upstreamCode(status) {
   if (status === 429) return 'RATE_LIMIT';
@@ -169,4 +190,4 @@ async function analyzeResume(input, options = {}) {
   });
 }
 
-module.exports = { SYSTEM_PROMPT, FALLBACK_SETTINGS, preparePromptConfig, buildUserPrompt, parseModelJson, analyzeResume, upstreamCode };
+module.exports = { SYSTEM_PROMPT, FALLBACK_SETTINGS, preparePromptConfig, buildUserPrompt, parseModelJson, validateAnalysisSchema, analyzeResume, upstreamCode };

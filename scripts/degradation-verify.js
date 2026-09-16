@@ -4,11 +4,12 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
-const { analyzeResume, upstreamCode } = require('../deepseek');
+const { analyzeResume, parseModelJson, upstreamCode } = require('../deepseek');
 
 const valid = {
-  duties: ['职责'], matches: [['要求', '证据', '中', '否', '建议']], finalResume: '真实简历',
-  questions: [], comparisons: [], interview: []
+  score: 70, scoreSummary: '结论', scoreDescription: '说明', highestRisk: '风险', finalResume: '真实简历', intro: '介绍',
+  duties: ['职责1', '职责2', '职责3', '职责4'], hard: ['要求1', '要求2', '要求3', '要求4'], implicit: ['隐含1', '隐含2', '隐含3'], ideal: ['特征1', '特征2', '特征3'], keywords: Array.from({ length: 8 }, (_, i) => `词${i}`),
+  evidenceToPrepare: ['证据1', '证据2', '证据3', '证据4'], dataGaps: ['缺口1', '缺口2', '缺口3', '缺口4'], capabilities: [['能力', '高', '判断']], dimensions: Array.from({ length: 6 }, (_, i) => [`维度${i}`, 70]), issues: [['P1', '问题', '说明', 'amber']], matches: Array.from({ length: 6 }, (_, i) => [`要求${i}`, '证据', '中', '否', '建议']), questions: Array.from({ length: 5 }, (_, i) => [`问题${i}`, '目的']), comparisons: Array.from({ length: 4 }, (_, i) => [`模块${i}`, '前', '后', '理由', '风险']), interview: Array.from({ length: 10 }, (_, i) => [`追问${i}`, '准备'])
 };
 
 async function main() {
@@ -36,6 +37,11 @@ async function main() {
   catch (error) { failure = error; }
   assert.strictEqual(failure.code, 'MODEL_UNAVAILABLE');
   assert.strictEqual(failure.statusCode, 503);
+
+  let schemaFailure;
+  try { parseModelJson(JSON.stringify({ duties: ['职责'], matches: [], finalResume: '简历' })); }
+  catch (error) { schemaFailure = error; }
+  assert.strictEqual(schemaFailure.code, 'INVALID_MODEL_SCHEMA');
 
   calls = 0;
   global.fetch = async () => { calls++; return new Response(JSON.stringify({ error: { message: 'bad key' } }), { status: 401 }); };
