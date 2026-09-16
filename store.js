@@ -778,7 +778,7 @@ function logStats(days = 7, filters = {}) {
     if (calls >= alertMinCalls && threshold > 0 && rate >= threshold) alerts.push({ scope, metric, rate, threshold, calls, message });
   };
   addAlert('overall', 'failureRate', total ? failed / total * 100 : 0, Number(settings.alertFailureRate), total, `整体失败率 ${total ? (failed / total * 100).toFixed(1) : '0.0'}% 超过阈值`);
-  const schemaErrorCount = Object.values(schemaFields).reduce((sum, count) => sum + count, 0);
+  const schemaErrorCount = rows.filter(r => (r.validationErrors || []).length > 0).length;
   addAlert('overall', 'schemaErrorRate', total ? schemaErrorCount / total * 100 : 0, Number(settings.alertSchemaErrorRate), total, `整体 Schema 错误率 ${total ? (schemaErrorCount / total * 100).toFixed(1) : '0.0'}% 超过阈值`);
   const retryCount = rows.filter(r => Number(r.attempts || 1) > 1).length;
   addAlert('overall', 'retryRate', total ? retryCount / total * 100 : 0, Number(settings.alertRetryRate), total, `整体重试率 ${total ? (retryCount / total * 100).toFixed(1) : '0.0'}% 超过阈值`);
