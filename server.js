@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const { analyzeResume } = require('./deepseek');
 const store = require('./store');
+const { createAuth } = require('./auth');
 
 const root = __dirname;
 const types = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml' };
@@ -25,9 +26,14 @@ const PUBLIC_ALIASES = new Map([['/', '/index.html'], ['/admin', '/admin.html']]
 const port = Number(process.env.PORT || 4173);
 const BODY_LIMIT = 120000;
 const ADMIN_LIMIT = 400000;
+const auth = createAuth();
+const loginAttempts = new Map();
+const LOGIN_WINDOW_MS = 10 * 60 * 1000;
+const LOGIN_BLOCK_MS = 15 * 60 * 1000;
+const LOGIN_MAX_FAILURES = 5;
 
-function send(res, status, payload) {
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+function send(res, status, payload, headers = {}) {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...headers });
   res.end(JSON.stringify(payload));
 }
 
@@ -134,19 +140,19 @@ const routes = {
 
   'POST /api/prompts': async (req, res) => {
     const body = await readBody(req, ADMIN_LIMIT);
-    send(res, 201, { prompt: store.createPrompt(body, body.actor) });
+    send(res, 201, { prompt: store.createPrompt(body, req.auth.username) });
   },
 
   'PUT /api/prompts/:id': async (req, res, url, params) => {
     const body = await readBody(req, ADMIN_LIMIT);
-    const prompt = store.updatePrompt(params.id, body, body.actor);
+    const prompt = store.updatePrompt(params.id, body, req.auth.username);
     if (!prompt) return send(res, 404, { error: 'Prompt 不存在' });
     send(res, 200, { prompt });
   },
 
   'POST /api/prompts/:id/toggle': async (req, res, url, params) => {
     const body = await readBody(req, ADMIN_LIMIT);
-    const prompt = store.setEnabled(params.id, body.enabled !== false, body.actor);
+    const prompt = store.setEnabled(params.id, body.enabled !== false, req.auth.username);
     if (!prompt) return send(res, 404, { error: 'Prompt 不存在' });
     send(res, 200, { prompt });
   },
@@ -154,28 +160,28 @@ const routes = {
   'POST /api/prompts/:id/rollback': async (req, res, url, params) => {
     const body = await readBody(req, ADMIN_LIMIT);
     if (!body.vid) return send(res, 400, { error: '缺少目标版本 vid' });
-    const result = store.rollbackPrompt(params.id, body.vid, body.actor);
+    const result = store.rollbackPrompt(params.id, body.vid, req.auth.username);
     if (!result) return send(res, 404, { error: 'Prompt 或目标版本不存在' });
     send(res, 200, result);
   },
 
   'POST /api/prompts/:id/submit-review': async (req, res, url, params) => {
     const body = await readBody(req, ADMIN_LIMIT);
-    const prompt = store.submitPromptReview(params.id, body);
+    const prompt = store.submitPromptReview(params.id, { ...body, actor: req.auth.username });
     if (!prompt) return send(res, 404, { error: 'Prompt 不存在' });
     send(res, 200, { prompt });
   },
 
   'POST /api/prompts/:id/reject-review': async (req, res, url, params) => {
     const body = await readBody(req, ADMIN_LIMIT);
-    const prompt = store.rejectPromptReview(params.id, body);
+    const prompt = store.rejectPromptReview(params.id, { ...body, actor: req.auth.username });
     if (!prompt) return send(res, 404, { error: 'Prompt 不存在' });
     send(res, 200, { prompt });
   },
 
   'POST /api/prompts/:id/publish': async (req, res, url, params) => {
     const body = await readBody(req, ADMIN_LIMIT);
-    const prompt = store.publishPrompt(params.id, body);
+    const prompt = store.publishPrompt(params.id, { ...body, actor: req.auth.username });
     if (!prompt) return send(res, 404, { error: 'Prompt 不存在' });
     send(res, 200, { prompt });
   },
@@ -183,13 +189,13 @@ const routes = {
   'POST /api/prompts/:id/production-rollback': async (req, res, url, params) => {
     const body = await readBody(req, ADMIN_LIMIT);
     if (!body.vid) return send(res, 400, { error: '缺少目标版本 vid' });
-    const result = store.rollbackProduction(params.id, body.vid, body);
+    const result = store.rollbackProduction(params.id, body.vid, { ...body, actor: req.auth.username });
     if (!result) return send(res, 404, { error: 'Prompt 或目标版本不存在' });
     send(res, 200, result);
   },
 
   'DELETE /api/prompts/:id': (req, res, url, params) => {
-    if (!store.removePrompt(params.id, url.searchParams.get('actor'))) return send(res, 404, { error: 'Prompt 不存在' });
+    if (!store.removePrompt(params.id, req.auth.username)) return send(res, 404, { error: 'Prompt 不存在' });
     send(res, 200, { ok: true });
   },
 
@@ -227,9 +233,57 @@ const routes = {
 
   'PUT /api/settings': async (req, res) => {
     const body = await readBody(req, ADMIN_LIMIT);
-    send(res, 200, { settings: store.saveSettings(body, body.actor) });
+    send(res, 200, { settings: store.saveSettings(body, req.auth.username) });
   }
 };
+
+const PUBLIC_API = new Set([
+  'GET /api/health', 'POST /api/analyze',
+  'GET /api/auth/status', 'POST /api/auth/login', 'POST /api/auth/logout'
+]);
+
+function requiredRole(method, pathname) {
+  if (PUBLIC_API.has(`${method} ${pathname}`)) return null;
+  if (method === 'GET') return 'viewer';
+  if (method === 'POST' && pathname === '/api/prompts') return 'editor';
+  if (method === 'PUT' && /^\/api\/prompts\/[^/]+$/.test(pathname)) return 'editor';
+  if (method === 'POST' && /^\/api\/prompts\/[^/]+\/(toggle|rollback|submit-review)$/.test(pathname)) return 'editor';
+  return 'admin';
+}
+
+async function handleAuth(req, res, pathname) {
+  if (pathname === '/api/auth/status' && req.method === 'GET') {
+    const user = auth.current(req);
+    return send(res, 200, { authenticated: !!user, user });
+  }
+  if (pathname === '/api/auth/login' && req.method === 'POST') {
+    const body = await readBody(req, 20000);
+    const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
+    const key = `${ip}:${String(body.username || '').trim().toLowerCase()}`;
+    const now = Date.now();
+    let attempt = loginAttempts.get(key);
+    if (attempt && attempt.blockedUntil > now) {
+      return send(res, 429, { error: '登录失败次数过多，请稍后再试', code: 'LOGIN_RATE_LIMITED' });
+    }
+    if (!attempt || attempt.windowUntil <= now) attempt = { failures: 0, windowUntil: now + LOGIN_WINDOW_MS, blockedUntil: 0 };
+    const result = auth.login(body.username, body.password);
+    if (!result) {
+      attempt.failures += 1;
+      if (attempt.failures >= LOGIN_MAX_FAILURES) attempt.blockedUntil = now + LOGIN_BLOCK_MS;
+      loginAttempts.set(key, attempt);
+      console.warn(`[auth] 登录失败：${ip} / ${String(body.username || '').slice(0, 80)} / ${attempt.failures} 次`);
+      if (attempt.blockedUntil) return send(res, 429, { error: '登录失败次数过多，请稍后再试', code: 'LOGIN_RATE_LIMITED' });
+      return send(res, 401, { error: '用户名或密码错误', code: 'INVALID_CREDENTIALS' });
+    }
+    loginAttempts.delete(key);
+    return send(res, 200, { authenticated: true, user: result.user }, { 'Set-Cookie': auth.cookie(result.token, req) });
+  }
+  if (pathname === '/api/auth/logout' && req.method === 'POST') {
+    auth.revoke(req);
+    return send(res, 200, { ok: true }, { 'Set-Cookie': auth.cookie('', req, 0) });
+  }
+  return send(res, 405, { error: '请求方法不支持', code: 'METHOD_NOT_ALLOWED' });
+}
 
 /** 极简路由：支持 /api/prompts/:id/rollback 这类带参路径 */
 function matchRoute(method, pathname) {
@@ -258,6 +312,11 @@ http.createServer(async (req, res) => {
   const pathname = decodeURIComponent(url.pathname);
 
   if (pathname.startsWith('/api/')) {
+    if (pathname.startsWith('/api/auth/')) {
+      try { await handleAuth(req, res, pathname); }
+      catch (error) { if (!res.headersSent) send(res, error.statusCode || 400, { error: error.message, code: error.code || 'AUTH_FAILED' }); }
+      return;
+    }
     if (pathname === '/api/analyze') {
       if (req.method !== 'POST') return send(res, 405, { error: '请求方法不支持' });
       try { await handleAnalyze(req, res); }
@@ -266,6 +325,13 @@ http.createServer(async (req, res) => {
         if (!res.headersSent) send(res, 500, { error: '分析失败', code: 'ANALYZE_FAILED' });
       }
       return;
+    }
+    const role = requiredRole(req.method, pathname);
+    if (role) {
+      const user = auth.current(req);
+      if (!user) return send(res, 401, { error: '请先登录管理后台', code: 'UNAUTHENTICATED' });
+      if (!auth.hasRole(user, role)) return send(res, 403, { error: `当前角色无权执行此操作，需要 ${role} 权限`, code: 'FORBIDDEN' });
+      req.auth = user;
     }
     const match = matchRoute(req.method, pathname);
     if (!match) return send(res, 404, { error: '接口不存在', code: 'NOT_FOUND' });

@@ -1,5 +1,6 @@
 dist/
 node_modules/
+.env
 .DS_Store
 
 # 运行时数据：Prompt 配置、版本历史、调用日志（logs.jsonl 会持续增长）

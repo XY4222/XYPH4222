@@ -20,7 +20,7 @@ const port = 4800 + Math.floor(Math.random() * 300);
 const base = `http://127.0.0.1:${port}`;
 const server = spawn(process.execPath, ['server.js'], {
   cwd: staged,
-  env: { ...process.env, PORT: String(port) },
+    env: { ...process.env, PORT: String(port), NODE_ENV: 'test', ADMIN_AUTH_DISABLED: 'true' },
   stdio: ['ignore', 'pipe', 'pipe']
 });
 let serverLog = '';

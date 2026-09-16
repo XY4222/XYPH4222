@@ -9,6 +9,7 @@
   const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
 
   const state = {
+    auth: null,
     route: 'prompts',
     overview: null,
     prompts: [],
@@ -55,8 +56,51 @@
       body: options && options.body !== undefined ? JSON.stringify(options.body) : undefined
     });
     const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload.error || `请求失败（HTTP ${response.status}）`);
+    if (!response.ok) {
+      const error = new Error(payload.error || `请求失败（HTTP ${response.status}）`);
+      error.code = payload.code;
+      error.status = response.status;
+      if (response.status === 401 && !path.startsWith('/api/auth/')) setTimeout(() => renderLogin('登录已过期，请重新登录'), 0);
+      throw error;
+    }
     return payload;
+  }
+
+  const ROLE_LEVEL = { viewer: 1, editor: 2, admin: 3 };
+  const ROLE_LABEL = { viewer: '查看者', editor: '编辑者', admin: '管理员' };
+  function can(role) { return !!state.auth && ROLE_LEVEL[state.auth.role] >= ROLE_LEVEL[role]; }
+
+  function updateAccount() {
+    const user = state.auth;
+    $('#accountName').textContent = user ? user.username : '未登录';
+    $('#accountRole').textContent = user ? (ROLE_LABEL[user.role] || user.role) : '访客';
+    $('#accountAvatar').textContent = user ? user.username.slice(0, 1).toUpperCase() : '访';
+    $('#logoutBtn').style.display = user ? '' : 'none';
+  }
+
+  function renderLogin(message) {
+    state.auth = null;
+    updateAccount();
+    $('#page').innerHTML = `<section class="panel" style="max-width:460px;margin:70px auto">
+      <div class="panel-head"><div><h2>登录 Prompt 管理后台</h2><p>账号由服务端环境变量配置，密码不会保存在浏览器中。</p></div></div>
+      <form id="loginForm" style="padding:24px">
+        ${message ? `<div class="banner error show">${escapeHtml(message)}</div>` : ''}
+        <div class="field"><label>用户名</label><input id="loginUsername" autocomplete="username" required /></div>
+        <div class="field"><label>密码</label><input id="loginPassword" type="password" autocomplete="current-password" required /></div>
+        <button class="primary" type="submit" style="width:100%">登录</button>
+      </form>
+    </section>`;
+    $('#loginForm').addEventListener('submit', async event => {
+      event.preventDefault();
+      try {
+        const result = await api('/api/auth/login', {
+          method: 'POST', body: { username: $('#loginUsername').value.trim(), password: $('#loginPassword').value }
+        });
+        state.auth = result.user;
+        updateAccount();
+        await loadAuthenticatedApp();
+      } catch (error) { renderLogin(error.message); }
+    });
   }
 
   function timeAgo(iso) {
@@ -218,7 +262,7 @@
     return `
       <div class="headline">
         <div><h1>Prompt 总览</h1><p>统一维护 Prompt 工作副本。编辑只保存草稿，生产版本在发布中心单独控制。</p></div>
-        <button class="primary" id="newBtn">＋ 新建 Prompt</button>
+        ${can('editor') ? '<button class="primary" id="newBtn">＋ 新建 Prompt</button>' : ''}
       </div>
       ${truncationNotice()}
       <section class="stats">
@@ -278,9 +322,9 @@
         <td>${over ? `<span class="tag red" title="超出单条上限 ${maxChars} 字符，超出部分不会发给模型">${p.contentLength} 超限</span>` : `<span class="version">${p.contentLength}</span>`}</td>
         <td class="prompt-meta">${timeAgo(p.updatedAt)}</td>
         <td><div class="actions">
-          <button class="iconbtn" data-act="edit" data-id="${p.id}">编辑</button>
+          ${can('editor') ? `<button class="iconbtn" data-act="edit" data-id="${p.id}">编辑</button>` : ''}
           <button class="iconbtn" data-act="history" data-id="${p.id}">历史</button>
-          <button class="iconbtn" data-act="toggle" data-id="${p.id}" data-enabled="${p.enabled ? 'false' : 'true'}">${p.enabled ? '停用' : '启用'}</button>
+          ${can('editor') ? `<button class="iconbtn" data-act="toggle" data-id="${p.id}" data-enabled="${p.enabled ? 'false' : 'true'}">${p.enabled ? '停用' : '启用'}</button>` : ''}
         </div></td>
       </tr>`;
     }).join('');
@@ -297,9 +341,9 @@
         : p.releaseStatus === 'draft' ? tag('草稿', 'blue') : tag('已发布', 'green');
       let actions = '<span class="prompt-meta">无需操作</span>';
       if (p.releaseStatus === 'draft') {
-        actions = `<button class="iconbtn" data-act="edit" data-id="${p.id}">编辑</button><button class="iconbtn" data-act="submit-review" data-id="${p.id}">提交审核</button>`;
+        actions = can('editor') ? `<button class="iconbtn" data-act="edit" data-id="${p.id}">编辑</button><button class="iconbtn" data-act="submit-review" data-id="${p.id}">提交审核</button>` : '<span class="prompt-meta">等待编辑者提交</span>';
       } else if (p.releaseStatus === 'review') {
-        actions = `<button class="iconbtn" data-act="reject-review" data-id="${p.id}">驳回</button><button class="primary" style="padding:6px 10px" data-act="publish" data-id="${p.id}">发布生产</button>`;
+        actions = can('admin') ? `<button class="iconbtn" data-act="reject-review" data-id="${p.id}">驳回</button><button class="primary" style="padding:6px 10px" data-act="publish" data-id="${p.id}">发布生产</button>` : '<span class="prompt-meta">等待管理员审核</span>';
       }
       return `<tr>
         <td><div class="prompt-name">${escapeHtml(p.name)}</div><div class="prompt-meta">${escapeHtml(p.desc || '')}</div></td>
@@ -433,7 +477,7 @@
             ${[1, 7, 30, 90].map(d => `<option value="${d}"${state.logDays === d ? ' selected' : ''}>近 ${d} 天</option>`).join('')}
           </select>
           <button class="secondary" id="reloadLogs">刷新</button>
-          <button class="secondary" id="pruneLogs">清理过期</button>
+          ${can('admin') ? '<button class="secondary" id="pruneLogs">清理过期</button>' : ''}
         </div>
       </div>
       <section class="stats">
@@ -513,7 +557,7 @@
           </div>
           <div style="display:flex;justify-content:flex-end;gap:9px;margin-top:6px">
             <button class="secondary" id="reloadSettings">放弃修改</button>
-            <button class="primary" id="saveSettings">保存设置</button>
+            ${can('admin') ? '<button class="primary" id="saveSettings">保存设置</button>' : ''}
           </div>
         </div>
       </section>`;
@@ -641,8 +685,8 @@
         <span class="vmeta">${tag(v.actionLabel || v.action, ACTION_TAG[v.action])}${fullTime(v.at)} · ${escapeHtml(v.actor || '管理员')}${v.note ? ` · ${escapeHtml(v.note)}` : ''}${isCurrent ? ' · 当前版本' : ''}</span>
         <span class="actions">
           ${isCurrent ? '' : `<button class="iconbtn" data-act="diff" data-vid="${v.vid}" data-index="${index}">与当前对比</button>`}
-          ${isCurrent ? '' : `<button class="iconbtn" data-act="restore" data-vid="${v.vid}" data-version="${escapeHtml(v.version)}">恢复为草稿</button>`}
-          ${isCurrent ? '' : `<button class="iconbtn" data-act="production-rollback" data-vid="${v.vid}" data-version="${escapeHtml(v.version)}">回滚生产</button>`}
+          ${isCurrent || !can('editor') ? '' : `<button class="iconbtn" data-act="restore" data-vid="${v.vid}" data-version="${escapeHtml(v.version)}">恢复为草稿</button>`}
+          ${isCurrent || !can('admin') || !['seed', 'publish', 'production_rollback'].includes(v.action) ? '' : `<button class="iconbtn" data-act="production-rollback" data-vid="${v.vid}" data-version="${escapeHtml(v.version)}">回滚生产</button>`}
         </span>
       </div>`;
     }).join('');
@@ -883,9 +927,14 @@
 
   $$('#nav button').forEach(btn => btn.addEventListener('click', () => navigate(btn.dataset.route)));
 
+  $('#logoutBtn').addEventListener('click', async () => {
+    try { await api('/api/auth/logout', { method: 'POST', body: {} }); }
+    finally { renderLogin('已安全退出'); }
+  });
+
   /* ---------- 启动 ---------- */
 
-  (async function start() {
+  async function loadAuthenticatedApp() {
     setNav(state.route);
     try {
       await refreshPrompts();
@@ -900,6 +949,18 @@
     } catch (error) {
       showConnError(`无法连接到管理接口：${error.message}。请通过 node server.js 启动后访问 /admin。`);
       $('#page').innerHTML = loading('数据加载失败');
+    }
+  }
+
+  (async function start() {
+    try {
+      const status = await api('/api/auth/status');
+      if (!status.authenticated) return renderLogin();
+      state.auth = status.user;
+      updateAccount();
+      await loadAuthenticatedApp();
+    } catch (error) {
+      renderLogin(`鉴权服务不可用：${error.message}`);
     }
   })();
 })();

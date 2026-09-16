@@ -67,7 +67,7 @@ async function main() {
 
   const server = spawn(process.execPath, ['server.js'], {
     cwd: dir,
-    env: { ...process.env, PORT: String(port) },
+    env: { ...process.env, PORT: String(port), NODE_ENV: 'test', ADMIN_AUTH_DISABLED: 'true' },
     stdio: ['ignore', 'pipe', 'pipe']
   });
   let serverLog = '';
