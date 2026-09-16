@@ -23,6 +23,7 @@ async function main() {
     const deleted = await call(`/api/rules/${created.body.item.id}`, 'DELETE'); check('管理员可以删除规则', deleted.status === 200);
     const changes = await call('/api/changes?limit=30'); check('规则操作进入审计', changes.body.items.some(item => item.action === 'rule_create') && changes.body.items.some(item => item.action === 'rule_delete'));
     const html = fs.readFileSync(path.join(PROJECT, 'admin.html'), 'utf8'); const js = fs.readFileSync(path.join(PROJECT, 'admin.js'), 'utf8'); check('后台包含风险规则入口', html.includes('data-route="rules"') && js.includes('function viewRules'));
+    const app = fs.readFileSync(path.join(PROJECT, 'app.js'), 'utf8'); check('用户端展示规则命中警告', app.includes('riskCheck') && app.includes('输出风险检查'));
   } finally { server.kill('SIGKILL'); await wait(150); try { fs.rmSync(staged, { recursive: true, force: true }); } catch {} }
   console.log(`\n────────  风险规则通过 ${passed} · 失败 ${failed} ────────`); process.exit(failed ? 1 : 0);
 }

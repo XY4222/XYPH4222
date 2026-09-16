@@ -68,7 +68,7 @@ let analysis = {
 };
 
 const state = {
-  current: 'input', analyzed: false, answers: Array(8).fill(''), bullets: Array(8).fill(''), style: 'balanced', provider: null, form: {...example, role:'',industry:'',company:'',stage:'',highlights:[],jd:'',resume:'',extra:''}
+  current: 'input', analyzed: false, answers: Array(8).fill(''), bullets: Array(8).fill(''), style: 'balanced', provider: null, riskCheck: null, runId: null, form: {...example, role:'',industry:'',company:'',stage:'',highlights:[],jd:'',resume:'',extra:''}
 };
 
 const $ = (s, root=document) => root.querySelector(s);
@@ -125,7 +125,9 @@ function renderJD() {
 
 function renderDiagnosis() {
   const score = Math.max(0, Math.min(100, Number(analysis.score ?? 64)));
+  const riskNotice = state.riskCheck && !state.riskCheck.passed ? `<div class="risk-strip"><strong>输出风险检查：</strong>命中 ${state.riskCheck.violations.length} 条服务端规则：${state.riskCheck.violations.map(item => `${escapeHtml(item.ruleName)}（${escapeHtml(item.severity)}）`).join('、')}。请先人工核验，再复制使用。</div>` : '';
   return `${pageHead(3,'简历诊断','评分反映当前简历对这份 JD 的证据覆盖程度，不等同于录用概率。','基于 6 个维度')}
+  ${riskNotice}
   <div class="card score-hero"><div class="score-ring" style="--score:${score}"><div class="score-value"><strong>${score}</strong><span>当前匹配度</span></div></div><div class="score-summary"><span class="badge ${score>=75?'green':score>=55?'amber':'red'}">${score>=75?'较高匹配':score>=55?'中等匹配 · 有明显缺口':'低匹配 · 关键证据不足'}</span><h3>${escapeHtml(analysis.scoreSummary || '岗位证据需要进一步补强')}</h3><p>${escapeHtml(analysis.scoreDescription || '评分基于当前 JD 与简历证据，不代表录用概率。')}</p><div class="score-metrics"><div class="metric-mini"><span>分析模型</span><strong>${escapeHtml(state.provider?.model || 'DeepSeek')}</strong></div><div class="metric-mini"><span>证据映射</span><strong>${analysis.matches.length} 项</strong></div><div class="metric-mini"><span>修改优先项</span><strong>${analysis.issues.length} 项</strong></div><div class="metric-mini"><span>判断置信度</span><strong>中</strong></div></div></div></div>
   <div class="grid two" style="margin-bottom:16px"><div class="card card-pad"><h3 class="card-title">维度评分</h3>${analysis.dimensions.map(([n,v])=>`<div class="dimension-row"><span>${n}</span><div class="progress"><i style="width:${v}%"></i></div><strong>${v}</strong></div>`).join('')}</div><div class="card card-pad"><h3 class="card-title" style="margin-bottom:14px">评分口径</h3><ul class="list-clean"><li><strong>加分：</strong>5 年 ToB、ERP/WMS 场景、具备数据工具基础</li><li><strong>扣分：</strong>AI 仅个人 Demo、结果量化不足、主导程度模糊</li><li><strong>边界：</strong>仅基于用户提供的 JD 与简历文本</li><li><strong>置信度：</strong>中；关键项目结果尚待追问确认</li></ul></div></div>
   <div class="grid two">${analysis.issues.map(([p,t,d,c])=>`<div class="card issue-card"><div class="priority"><span class="badge ${c}">${p}</span><span class="badge">置信度：高</span></div><h4>${t}</h4><p>${d}</p></div>`).join('')}</div>${nextButton('match','查看匹配分析')}`;
@@ -219,7 +221,7 @@ document.addEventListener('click', async e=>{
       const response=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(state.form)});
       const result=await response.json().catch(()=>({}));
       if(!response.ok) throw new Error(result.error||`分析请求失败（HTTP ${response.status}）`);
-      analysis={...analysis,...result.analysis};
+      analysis={...analysis,...result.analysis}; state.riskCheck=result.riskCheck||null; state.runId=result.runId||null;
       state.provider={model:result.model,usage:result.usage};
       state.answers=Array(analysis.questions.length).fill(''); state.bullets=Array(analysis.questions.length).fill('');
       state.analyzed=true; state.current='jd'; render(); showToast(`DeepSeek 分析完成 · ${result.model||'模型'}`);
