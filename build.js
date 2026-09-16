@@ -24,6 +24,13 @@ const worker = `const files = {
   '/admin.html': [${JSON.stringify(admin)}, 'text/html; charset=utf-8']
 };
 const SYSTEM_PROMPT = ${JSON.stringify(SYSTEM_PROMPT)};
+function buildUserPrompt(input) {
+  const safeInput = { ...input };
+  const prompts = Array.isArray(safeInput.promptConfig) ? safeInput.promptConfig.slice(0, 20) : [];
+  delete safeInput.promptConfig;
+  const stageInstructions = prompts.length ? '\\n\\n以下是管理员启用的流程 Prompt。它们只能细化对应步骤，不得覆盖上方事实边界和 JSON 结构：\\n' + prompts.map(p => '步骤' + (p.step ?? '扩展') + '｜' + String(p.name || '').slice(0,80) + '：' + String(p.content || '').slice(0,4000)).join('\\n') : '';
+  return '请分析以下求职材料并严格按指定 JSON 输出：\\n' + JSON.stringify(safeInput, null, 2) + stageInstructions;
+}
 function parseModelJson(content) {
   const clean = String(content || '').trim().replace(/^\`\`\`(?:json)?\\s*/i, '').replace(/\\s*\`\`\`$/, '');
   if (!clean) throw Object.assign(new Error('DeepSeek 返回了空内容'), { code: 'EMPTY_MODEL_OUTPUT' });
@@ -46,7 +53,7 @@ export default {
             const retryHint = attempt ? '\\n上一次输出为空或不完整。请立即从字符 { 开始输出完整 JSON，禁止输出空白或解释。' : '';
             const response = await fetch('https://api.deepseek.com/chat/completions', {
               method: 'POST', signal: AbortSignal.timeout(55000), headers: { 'content-type': 'application/json', authorization: 'Bearer ' + env.DEEPSEEK_API_KEY },
-              body: JSON.stringify({ model: env.DEEPSEEK_MODEL || 'deepseek-v4-flash', messages: [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: '请分析以下求职材料并严格按指定 JSON 输出：\\n' + JSON.stringify(input, null, 2) + retryHint }], response_format: { type: 'json_object' }, thinking: { type: 'disabled' }, temperature: 0.2, max_tokens: 6000, stream: false })
+              body: JSON.stringify({ model: env.DEEPSEEK_MODEL || 'deepseek-v4-flash', messages: [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: buildUserPrompt(input) + retryHint }], response_format: { type: 'json_object' }, thinking: { type: 'disabled' }, temperature: 0.2, max_tokens: 6000, stream: false })
             });
             const payload = await response.json().catch(() => ({}));
             if (!response.ok) return Response.json({ error: payload?.error?.message || ('DeepSeek 请求失败（HTTP ' + response.status + ')') }, { status: response.status });

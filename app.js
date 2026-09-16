@@ -200,6 +200,14 @@ function collectForm(){
   state.form.highlights=$$('input[name=highlight]:checked').map(x=>x.value);
 }
 
+function getActivePromptConfig(){
+  try {
+    const items=JSON.parse(localStorage.getItem('resume-expert-prompts-v2')||'[]');
+    if(!Array.isArray(items)) return [];
+    return items.filter(p=>p&&p.enabled&&p.content).slice(0,20).map(p=>({step:Number.isFinite(Number(p.step))?Number(p.step):null,stepKey:String(p.stepKey||'extension').slice(0,40),name:String(p.name||'自定义 Prompt').slice(0,80),content:String(p.content).slice(0,4000)}));
+  } catch { return []; }
+}
+
 function showToast(msg){ const t=$('#toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(showToast.timer); showToast.timer=setTimeout(()=>t.classList.remove('show'),2200); }
 function showDialog(){ const d=$('#dialog'); d.innerHTML=`<div class="dialog"><h3>导出功能即将开放</h3><p>当前版本已支持复制到剪贴板。PDF 与文件下载将在接入服务端后开放。</p><div class="dialog-actions"><button class="button primary" data-action="close-dialog">知道了</button></div></div>`; d.classList.add('open'); d.setAttribute('aria-hidden','false'); }
 async function copyText(text,msg='已复制到剪贴板'){ try{ await navigator.clipboard.writeText(text); showToast(msg); }catch{ const ta=document.createElement('textarea');ta.value=text;document.body.appendChild(ta);ta.select();document.execCommand('copy');ta.remove();showToast(msg); } }
@@ -216,7 +224,7 @@ document.addEventListener('click', async e=>{
     if(!state.form.role||!state.form.jd||!state.form.resume){ showToast('请先填写目标岗位、JD 和原始简历'); return; }
     btn.disabled=true; btn.innerHTML='DeepSeek 正在分析，可能需要 30–90 秒…';
     try {
-      const response=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(state.form)});
+      const response=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...state.form,promptConfig:getActivePromptConfig()})});
       const result=await response.json().catch(()=>({}));
       if(!response.ok) throw new Error(result.error||`分析请求失败（HTTP ${response.status}）`);
       analysis={...analysis,...result.analysis};

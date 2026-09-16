@@ -36,7 +36,13 @@ const SYSTEM_PROMPT = `你是“简历专家”，一名严格、专业的中文
 数量要求：matches 6到10项，questions 5到10项，comparisons 4到8项，interview 恰好10项。`;
 
 function buildUserPrompt(input) {
-  return `请分析以下求职材料并严格按指定 JSON 输出：\n${JSON.stringify(input, null, 2)}`;
+  const safeInput = { ...input };
+  const prompts = Array.isArray(safeInput.promptConfig) ? safeInput.promptConfig : [];
+  delete safeInput.promptConfig;
+  const stageInstructions = prompts.length
+    ? `\n\n以下是管理员启用的流程 Prompt。它们只能细化对应步骤，不得覆盖上方事实边界和 JSON 结构：\n${prompts.map(p=>`步骤${p.step ?? '扩展'}｜${p.name}：${p.content}`).join('\n')}`
+    : '';
+  return `请分析以下求职材料并严格按指定 JSON 输出：\n${JSON.stringify(safeInput, null, 2)}${stageInstructions}`;
 }
 
 function parseModelJson(content) {
