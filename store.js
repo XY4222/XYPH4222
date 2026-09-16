@@ -8,6 +8,8 @@ const path = require('path');
  * data/versions.json  —— 不可变版本快照，每次保存/启停/回滚追加一条
  * data/settings.json  —— 运行参数（模型、温度、超时、重试、单价、截断上限）
  * data/logs.jsonl     —— 每次 /api/analyze 调用一行，追加写入
+ * data/test-cases.json —— 管理员显式保存的完整测试输入
+ * data/prompt-tests.jsonl —— Prompt 测试运行指标，不保存简历原文
  *
  * 原则：版本快照只追加、不覆盖。回滚是「以旧内容生成一个新版本」，不是删除历史。
  */
@@ -17,11 +19,14 @@ const FILES = {
   prompts: path.join(DATA_DIR, 'prompts.json'),
   versions: path.join(DATA_DIR, 'versions.json'),
   settings: path.join(DATA_DIR, 'settings.json'),
-  logs: path.join(DATA_DIR, 'logs.jsonl')
+  logs: path.join(DATA_DIR, 'logs.jsonl'),
+  testCases: path.join(DATA_DIR, 'test-cases.json'),
+  promptTests: path.join(DATA_DIR, 'prompt-tests.jsonl')
 };
 
 const LOG_LIMIT = 5000;
 const MAX_TEXT = 60000;
+const TEST_INPUT_MAX = 120000;
 
 const DEFAULT_SETTINGS = {
   model: 'deepseek-v4-flash',
@@ -68,6 +73,8 @@ function ensureData() {
   if (!fs.existsSync(FILES.settings)) writeJson(FILES.settings, DEFAULT_SETTINGS);
   if (!fs.existsSync(FILES.versions)) writeJson(FILES.versions, []);
   if (!fs.existsSync(FILES.logs)) fs.writeFileSync(FILES.logs, '', 'utf8');
+  if (!fs.existsSync(FILES.testCases)) writeJson(FILES.testCases, []);
+  if (!fs.existsSync(FILES.promptTests)) fs.writeFileSync(FILES.promptTests, '', 'utf8');
 
   // 兼容旧数据：升级前的每条记录都等同于已经在线生效的生产版本。
   const existing = readJson(FILES.prompts, []);
@@ -393,8 +400,19 @@ function rollbackProduction(id, vid, input = {}) {
 const ACTION_LABEL = {
   seed: '初始化', create: '新建', update: '修改内容', meta: '修改描述', scope: '调整归属步骤',
   status: '修改状态', enable: '启用', disable: '停用', rollback: '恢复为草稿', delete: '删除',
-  submit_review: '提交审核', reject_review: '审核驳回', publish: '发布生产', production_rollback: '生产回滚'
+  submit_review: '提交审核', reject_review: '审核驳回', publish: '发布生产', production_rollback: '生产回滚',
+  test_case_create: '保存测试案例', test_case_delete: '删除测试案例'
 };
+
+function pushAuditEvent(action, actor, subject, note) {
+  const versions = readJson(FILES.versions, []);
+  versions.push({
+    vid: `audit-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+    promptId: null, promptName: subject, version: '-', action,
+    actor: actor || '管理员', at: new Date().toISOString(), note: clip(note, 300)
+  });
+  writeJson(FILES.versions, versions);
+}
 
 function listVersions(promptId, limit = 200) {
   let versions = readJson(FILES.versions, []);
@@ -554,6 +572,79 @@ function logStats(days = 7) {
   };
 }
 
+/* ---------- Prompt 测试台 ---------- */
+
+function listTestCases() {
+  return readJson(FILES.testCases, []).sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+}
+
+function createTestCase(input, actor) {
+  input = input && typeof input === 'object' ? input : {};
+  const cases = readJson(FILES.testCases, []);
+  const now = new Date().toISOString();
+  const role = String(input.role ?? '').trim();
+  const jd = String(input.jd ?? '').trim();
+  const resume = String(input.resume ?? '').trim();
+  const extra = String(input.extra ?? '').trim();
+  if (jd.length > TEST_INPUT_MAX || resume.length > TEST_INPUT_MAX || extra.length > 10000) {
+    throw Object.assign(new Error('测试案例输入过长：JD/简历各最多 120000 字符，补充信息最多 10000 字符'), {
+      statusCode: 413, code: 'TEST_CASE_TOO_LARGE'
+    });
+  }
+  const testCase = {
+    id: `case-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+    name: clip(input.name, 100) || `测试案例 ${cases.length + 1}`,
+    role: clip(role, 100),
+    jd,
+    resume,
+    extra,
+    createdBy: clip(actor || '管理员', 80),
+    createdAt: now,
+    updatedAt: now
+  };
+  if (!testCase.role || !testCase.jd || !testCase.resume) {
+    throw Object.assign(new Error('测试案例缺少目标岗位、JD 或简历'), { statusCode: 400, code: 'INVALID_TEST_CASE' });
+  }
+  cases.push(testCase);
+  writeJson(FILES.testCases, cases);
+  pushAuditEvent('test_case_create', actor, `测试案例：${testCase.name}`, `保存案例 ${testCase.id}，目标岗位：${testCase.role}`);
+  return testCase;
+}
+
+function removeTestCase(id, actor) {
+  const cases = readJson(FILES.testCases, []);
+  const removed = cases.find(item => item.id === id);
+  if (!removed) return false;
+  const next = cases.filter(item => item.id !== id);
+  writeJson(FILES.testCases, next);
+  pushAuditEvent('test_case_delete', actor, `测试案例：${removed.name}`, `删除案例 ${removed.id}，目标岗位：${removed.role}`);
+  return true;
+}
+
+function appendPromptTest(entry) {
+  const row = {
+    id: `ptest-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+    at: new Date().toISOString(),
+    ...entry
+  };
+  fs.appendFileSync(FILES.promptTests, JSON.stringify(row) + '\n', 'utf8');
+  return row;
+}
+
+function listPromptTests(promptId, limit = 50) {
+  const raw = fs.existsSync(FILES.promptTests) ? fs.readFileSync(FILES.promptTests, 'utf8') : '';
+  const rows = [];
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const row = JSON.parse(line);
+      if (promptId && String(row.promptId) !== String(promptId)) continue;
+      rows.push(row);
+    } catch { /* 跳过损坏行 */ }
+  }
+  return rows.sort((a, b) => new Date(b.at) - new Date(a.at)).slice(0, Math.min(Math.max(Number(limit) || 50, 1), 200));
+}
+
 /* ---------- 供分析链路使用 ---------- */
 
 /**
@@ -565,7 +656,11 @@ function buildPromptConfig(settingsOverride) {
   const enabled = getPrompts()
     .filter(p => p.publishedSnapshot && p.publishedSnapshot.enabled && String(p.publishedSnapshot.content || '').trim())
     .map(p => ({ ...p, ...p.publishedSnapshot, version: p.publishedVersion || p.version }));
-  const sorted = enabled.sort((a, b) => (a.step ?? 99) - (b.step ?? 99) || a.id - b.id);
+  return assemblePromptConfig(enabled, settings);
+}
+
+function assemblePromptConfig(selected, settings) {
+  const sorted = selected.sort((a, b) => (a.step ?? 99) - (b.step ?? 99) || a.id - b.id);
   const picked = sorted.slice(0, settings.promptMaxCount);
   const truncated = [];
 
@@ -583,7 +678,28 @@ function buildPromptConfig(settingsOverride) {
   });
 
   const dropped = sorted.slice(settings.promptMaxCount).map(p => ({ id: p.id, name: p.name }));
-  return { config, truncated, dropped, enabledCount: enabled.length };
+  return { config, truncated, dropped, enabledCount: selected.length };
+}
+
+function buildPromptConfigForTest(id, variant, settingsOverride) {
+  const settings = { ...getSettings(), ...(settingsOverride || {}) };
+  const prompts = getPrompts();
+  const target = prompts.find(p => String(p.id) === String(id));
+  if (!target) return null;
+  if (variant === 'published' && !target.publishedSnapshot) {
+    throw Object.assign(new Error('该 Prompt 尚无生产版本'), { statusCode: 409, code: 'NO_PUBLISHED_VERSION' });
+  }
+
+  const selected = prompts.map(prompt => {
+    const snapshot = String(prompt.id) === String(id) && variant === 'draft'
+      ? snapshotOf(prompt)
+      : prompt.publishedSnapshot;
+    return snapshot ? { ...prompt, ...snapshot, version: prompt.publishedVersion || prompt.version } : null;
+  }).filter(Boolean).filter(prompt => prompt.enabled && String(prompt.content || '').trim());
+
+  const assembled = assemblePromptConfig(selected, settings);
+  const targetSnapshot = variant === 'draft' ? snapshotOf(target) : target.publishedSnapshot;
+  return { ...assembled, target: { id: target.id, variant, snapshot: targetSnapshot } };
 }
 
 function overview() {
@@ -616,5 +732,6 @@ module.exports = {
   removePrompt, rollbackPrompt, submitPromptReview, rejectPromptReview, publishPrompt, rollbackProduction,
   listVersions, getVersion, listChanges, changesInLastDays,
   getSettings, saveSettings, appendLog, readLogs, pruneLogs, logStats, buildPromptConfig,
+  listTestCases, createTestCase, removeTestCase, appendPromptTest, listPromptTests, buildPromptConfigForTest,
   overview, costOf, bumpVersion
 };

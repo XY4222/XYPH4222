@@ -31,7 +31,8 @@
     .collapse{border:1px solid var(--line);border-radius:8px;margin-top:14px;overflow:hidden}.collapse>summary{padding:12px 15px;cursor:pointer;font-weight:600;font-size:13px;background:#fbfcfd;list-style:none}.collapse>summary::-webkit-details-marker{display:none}.collapse>summary:before{content:'▸';display:inline-block;margin-right:8px;color:#93a0b0;transition:transform .15s}.collapse[open]>summary:before{transform:rotate(90deg)}.collapse .inner{padding:15px}
     .tabs{display:flex;gap:6px;border-bottom:1px solid var(--line);padding:0 18px;background:#fbfcfd}.tabs button{padding:12px 14px;color:var(--muted);border-bottom:2px solid transparent;font-weight:600}.tabs button.active{color:var(--blue);border-bottom-color:var(--blue)}
     .loading{padding:40px;text-align:center;color:var(--muted)}
-    @media(max-width:900px){.shell{flex-direction:column}.side{width:100%;height:auto;position:static;padding:16px}.brand{padding-bottom:16px}.nav{grid-auto-flow:column;overflow:auto}.nav .badge{display:none}.side-foot{display:none}.top{padding:0 18px}.wrap{padding:22px 16px}.stats{grid-template-columns:repeat(2,1fr)}.table th:nth-child(3),.table td:nth-child(3),.table td:nth-child(4),.table th:nth-child(4){display:none}.drawer{padding:22px 18px}}
+    .test-form{padding:18px}.test-form textarea{min-height:150px}.test-actions{display:flex;justify-content:flex-end;gap:9px;align-items:center;flex-wrap:wrap}.privacy-note{margin-right:auto;color:var(--amber);font-size:12px;max-width:620px}.result-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px;padding:18px}.result-card{border:1px solid var(--line);border-radius:8px;overflow:hidden}.result-card.failed{border-color:#f0ccd0}.result-card .result-head{display:flex;justify-content:space-between;align-items:center;padding:13px 15px;background:#fbfcfd;border-bottom:1px solid var(--line)}.result-card .result-body{padding:15px}.resume-output{white-space:pre-wrap;word-break:break-word;max-height:420px;overflow:auto;background:#f8fafc;border:1px solid var(--line);border-radius:6px;padding:13px;font-size:12px;line-height:1.7}.comparison{padding:15px 18px;border-top:1px solid var(--line);background:#fbfcfd}.case-list{display:grid;gap:8px;padding:14px 18px}.case-row{display:flex;align-items:center;gap:12px;border:1px solid var(--line);border-radius:7px;padding:11px 13px}.case-row .case-main{flex:1;min-width:0}.run-status{font-weight:650}.run-status.ok{color:var(--green)}.run-status.fail{color:var(--red)}
+    @media(max-width:900px){.shell{flex-direction:column}.side{width:100%;height:auto;position:static;padding:16px}.brand{padding-bottom:16px}.nav{grid-auto-flow:column;overflow:auto}.nav .badge{display:none}.side-foot{display:none}.top{padding:0 18px}.wrap{padding:22px 16px}.stats{grid-template-columns:repeat(2,1fr)}.result-grid{grid-template-columns:1fr}.table th:nth-child(3),.table td:nth-child(3),.table td:nth-child(4),.table th:nth-child(4){display:none}.drawer{padding:22px 18px}}
   </style>
 </head>
 <body>
@@ -41,6 +42,7 @@
       <nav class="nav" id="nav">
         <button data-route="prompts"><i>▦</i><span>Prompt 总览</span></button>
         <button data-route="releases"><i>⇧</i><span>发布中心</span></button>
+        <button data-route="tests"><i>⇄</i><span>Prompt 测试台</span></button>
         <button data-route="changes"><i>◷</i><span>变更记录</span></button>
         <button data-route="logs"><i>≣</i><span>运行日志</span></button>
         <button data-route="settings"><i>⚙</i><span>项目设置</span></button>

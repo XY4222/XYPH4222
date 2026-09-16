@@ -1,6 +1,6 @@
 /* 简历专家 · Prompt 管理后台
  * 数据全部来自服务端（data/ 目录），不再依赖 localStorage。
- * 页面：Prompt 总览 / 发布中心 / 变更记录 / 运行日志 / 项目设置
+ * 页面：Prompt 总览 / 发布中心 / Prompt 测试台 / 变更记录 / 运行日志 / 项目设置
  */
 (function () {
   'use strict';
@@ -20,6 +20,10 @@
     logDays: 7,
     logFilter: { ok: 'all' },
     settings: null,
+    testCases: [],
+    testRuns: [],
+    testResult: null,
+    testForm: { promptId: '', caseId: '', name: '', role: '', jd: '', resume: '', extra: '' },
     currentPrompt: null,
     currentVersions: []
   };
@@ -60,6 +64,7 @@
       const error = new Error(payload.error || `请求失败（HTTP ${response.status}）`);
       error.code = payload.code;
       error.status = response.status;
+      error.payload = payload;
       if (response.status === 401 && !path.startsWith('/api/auth/')) setTimeout(() => renderLogin('登录已过期，请重新登录'), 0);
       throw error;
     }
@@ -123,7 +128,8 @@
   const ACTION_TAG = {
     seed: 'grey', create: 'green', update: 'blue', meta: 'blue', scope: 'amber',
     status: 'grey', enable: 'green', disable: 'amber', rollback: 'amber', delete: 'red', settings: 'blue',
-    submit_review: 'amber', reject_review: 'red', publish: 'green', production_rollback: 'amber'
+    submit_review: 'amber', reject_review: 'red', publish: 'green', production_rollback: 'amber',
+    test_case_create: 'blue', test_case_delete: 'red'
   };
 
   function tag(text, tone) { return `<span class="tag ${tone || ''}">${escapeHtml(text)}</span>`; }
@@ -204,7 +210,7 @@
 
   /* ---------- 路由 ---------- */
 
-  const ROUTE_TITLE = { prompts: 'Prompt 总览', releases: '发布中心', changes: '变更记录', logs: '运行日志', settings: '项目设置' };
+  const ROUTE_TITLE = { prompts: 'Prompt 总览', releases: '发布中心', tests: 'Prompt 测试台', changes: '变更记录', logs: '运行日志', settings: '项目设置' };
 
   function setNav(route) {
     $('#crumb').textContent = ROUTE_TITLE[route] || route;
@@ -220,6 +226,7 @@
       if (route === 'changes') await loadChanges();
       else if (route === 'logs') await loadLogs();
       else if (route === 'settings') await loadSettings();
+      else if (route === 'tests') await loadTests();
       else if ((route === 'prompts' || route === 'releases') && !state.overview) await loadPrompts();
     } catch (error) { showConnError(error.message); }
   }
@@ -228,6 +235,7 @@
     const page = $('#page');
     if (state.route === 'prompts') page.innerHTML = viewPrompts();
     else if (state.route === 'releases') page.innerHTML = viewReleases();
+    else if (state.route === 'tests') page.innerHTML = viewTests();
     else if (state.route === 'changes') page.innerHTML = viewChanges();
     else if (state.route === 'logs') page.innerHTML = viewLogs();
     else page.innerHTML = viewSettings();
@@ -239,6 +247,59 @@
   }
 
   function loading(text) { return `<div class="panel"><div class="loading">${escapeHtml(text || '加载中…')}</div></div>`; }
+
+  function captureTestForm() {
+    const fields = ['promptId', 'caseId', 'name', 'role', 'jd', 'resume', 'extra'];
+    fields.forEach(key => {
+      const el = $('#test-' + key);
+      if (el) state.testForm[key] = el.value;
+    });
+    return { ...state.testForm };
+  }
+
+  function testResultCard(label, result) {
+    if (!result) return `<article class="result-card"><div class="result-head"><strong>${label}</strong>${tag('未运行')}</div><div class="empty">尚无结果</div></article>`;
+    if (!result.ok) return `<article class="result-card failed"><div class="result-head"><strong>${label}</strong>${tag('失败', 'red')}</div><div class="result-body"><p class="run-status fail">${escapeHtml(result.code || 'PROMPT_TEST_FAILED')}</p><p>${escapeHtml(result.error || '测试调用失败')}</p><div class="prompt-meta">耗时 ${fmtLatency(result.latencyMs)}</div></div></article>`;
+    const usage = result.usage || {};
+    const analysis = result.analysis || {};
+    const config = result.promptConfig || {};
+    return `<article class="result-card"><div class="result-head"><strong>${label}</strong>${tag('成功', 'green')}</div><div class="result-body">
+      <div class="kv">
+        <div class="item"><label>模型</label><strong>${escapeHtml(result.model || '-')}</strong></div>
+        <div class="item"><label>匹配分数</label><strong>${escapeHtml(analysis.score ?? '-')}</strong></div>
+        <div class="item"><label>耗时</label><strong>${fmtLatency(result.latencyMs)}</strong></div>
+        <div class="item"><label>Token 入 / 出</label><strong>${fmtNumber(usage.prompt_tokens)} / ${fmtNumber(usage.completion_tokens)}</strong></div>
+        <div class="item"><label>估算成本</label><strong>¥${fmtCost(result.cost)}</strong></div>
+        <div class="item"><label>Prompt 注入</label><strong>${fmtNumber(config.applied)} 条</strong></div>
+      </div>
+      ${(config.truncated || []).length || (config.dropped || []).length ? `<div class="banner warn show" style="margin-top:14px;margin-bottom:14px">截断 ${(config.truncated || []).length} 条，丢弃 ${(config.dropped || []).length} 条</div>` : ''}
+      <h3>优化后简历</h3><div class="resume-output">${escapeHtml(analysis.finalResume || '模型未返回 finalResume')}</div>
+    </div></article>`;
+  }
+
+  function viewTests() {
+    const f = state.testForm;
+    const result = state.testResult;
+    const promptOptions = state.prompts.map(p => `<option value="${p.id}"${String(f.promptId) === String(p.id) ? ' selected' : ''}>${escapeHtml(p.name)} · 工作 ${escapeHtml(p.version)} / 生产 ${escapeHtml(p.publishedVersion || '未发布')}</option>`).join('');
+    const caseOptions = state.testCases.map(item => `<option value="${escapeHtml(item.id)}"${f.caseId === item.id ? ' selected' : ''}>${escapeHtml(item.name)} · ${escapeHtml(item.role)}</option>`).join('');
+    const comparison = result && result.comparison ? `<div class="comparison"><div class="kv">
+      <div class="item"><label>两侧均成功</label><strong>${result.comparison.bothSucceeded ? '是' : '否'}</strong></div>
+      <div class="item"><label>输出是否变化</label><strong>${result.comparison.finalResumeChanged == null ? '不可比较' : result.comparison.finalResumeChanged ? '有变化' : '无变化'}</strong></div>
+      <div class="item"><label>草稿分数差</label><strong>${result.comparison.scoreDelta == null ? '不可比较' : `${Number(result.comparison.scoreDelta) >= 0 ? '+' : ''}${result.comparison.scoreDelta}`}</strong></div>
+      <div class="item"><label>草稿耗时差</label><strong>${result.comparison.latencyDeltaMs == null ? '不可比较' : `${Number(result.comparison.latencyDeltaMs) >= 0 ? '+' : ''}${fmtLatency(result.comparison.latencyDeltaMs)}`}</strong></div>
+      <div class="item"><label>草稿成本差</label><strong>${result.comparison.costDelta == null ? '不可比较' : `${Number(result.comparison.costDelta) >= 0 ? '+' : ''}¥${fmtCost(result.comparison.costDelta)}`}</strong></div>
+    </div></div>` : '';
+    const cases = state.testCases.length ? state.testCases.map(item => `<div class="case-row"><div class="case-main"><div class="prompt-name">${escapeHtml(item.name)}</div><div class="prompt-meta">${escapeHtml(item.role)} · ${escapeHtml(item.createdBy)} · ${fullTime(item.updatedAt)}</div></div><button class="iconbtn" data-testcase-load="${escapeHtml(item.id)}">载入</button>${can('admin') ? `<button class="iconbtn danger-text" data-testcase-delete="${escapeHtml(item.id)}">删除</button>` : ''}</div>`).join('') : '<div class="empty">尚未保存测试案例</div>';
+    const runs = state.testRuns.length ? `<table class="table"><thead><tr><th>时间</th><th>Prompt</th><th>版本</th><th>状态</th><th>岗位</th><th>模型</th><th>耗时</th><th>Token</th><th>成本</th></tr></thead><tbody>${state.testRuns.map(run => `<tr><td class="prompt-meta">${fullTime(run.at)}</td><td>${escapeHtml(run.promptName)}</td><td>${tag(run.variant === 'draft' ? '草稿' : '生产', run.variant === 'draft' ? 'blue' : 'green')}</td><td><span class="run-status ${run.ok ? 'ok' : 'fail'}">${run.ok ? '成功' : escapeHtml(run.code || '失败')}</span></td><td>${escapeHtml(run.role || '-')}</td><td>${escapeHtml(run.model || '-')}</td><td>${fmtLatency(run.latencyMs)}</td><td>${fmtNumber(run.usage && run.usage.total_tokens)}</td><td>¥${fmtCost(run.cost)}</td></tr>`).join('')}</tbody></table>` : '<div class="empty">尚无测试运行记录</div>';
+    return `<div class="headline"><div><h1>Prompt 测试台</h1><p>用同一份输入对比当前生产快照与工作草稿；测试不会发布或改写任何 Prompt。</p></div><button class="secondary" id="reloadTests">刷新数据</button></div>
+      <section class="panel"><div class="panel-head"><div><h2>测试输入</h2><p>普通试运行只记录字符数与性能指标，不保存 JD 和简历原文</p></div></div><div class="test-form">
+        <div class="grid2"><div class="field"><label>目标 Prompt</label><select id="test-promptId" required>${promptOptions}</select></div><div class="field"><label>载入已保存案例</label><select id="test-caseId"><option value="">不载入</option>${caseOptions}</select></div><div class="field"><label>案例名称</label><input id="test-name" value="${escapeHtml(f.name)}" placeholder="例如：AI 产品经理 5 年经验" /></div><div class="field"><label>目标岗位</label><input id="test-role" value="${escapeHtml(f.role)}" placeholder="必填" /></div></div>
+        <div class="field"><label>职位描述 JD</label><textarea id="test-jd" placeholder="必填">${escapeHtml(f.jd)}</textarea></div><div class="field"><label>测试简历</label><textarea id="test-resume" placeholder="必填">${escapeHtml(f.resume)}</textarea></div><div class="field"><label>补充信息</label><textarea id="test-extra" style="min-height:90px">${escapeHtml(f.extra)}</textarea></div>
+        ${can('editor') ? `<div class="test-actions"><span class="privacy-note">保存为案例会把完整 JD、简历和补充信息持久化到服务端（JD/简历各最多 120000 字符）；普通试运行不会保存原文。</span><button class="secondary" id="saveTestCase">保存为测试案例</button><button class="primary" id="runPromptTest">对比草稿与生产</button></div>` : '<div class="banner warn show">当前为查看者权限：可以查看案例与运行记录，但不能运行测试或保存输入。</div>'}
+      </div></section>
+      ${result ? `<section class="panel"><div class="panel-head"><div><h2>本次对比结果</h2><p>${escapeHtml(result.prompt && result.prompt.name || '')}</p></div></div><div class="result-grid">${testResultCard('生产版本', result.results && result.results.published)}${testResultCard('工作草稿', result.results && result.results.draft)}</div>${comparison}</section>` : ''}
+      <section class="grid2"><div class="panel"><div class="panel-head"><div><h2>已保存测试案例</h2><p>这里包含完整测试输入，请按敏感数据管理</p></div></div><div class="case-list">${cases}</div></div><div class="panel"><div class="panel-head"><div><h2>最近运行</h2><p>仅保存指标和错误，不保存输入原文</p></div></div>${runs}</div></section>`;
+  }
 
   /* ---------- 视图：Prompt 总览 ---------- */
 
@@ -803,6 +864,21 @@
     } catch (error) { showConnError(`设置加载失败：${error.message}`); }
   }
 
+  async function loadTests() {
+    try {
+      if (!state.prompts.length) await refreshPrompts();
+      const [cases, runs] = await Promise.all([api('/api/test-cases'), api('/api/prompt-tests?limit=50')]);
+      state.testCases = cases.items || [];
+      state.testRuns = runs.items || [];
+      if (!state.testForm.promptId && state.prompts.length) state.testForm.promptId = String(state.prompts[0].id);
+      clearConnError();
+      render();
+    } catch (error) {
+      showConnError(`Prompt 测试台加载失败：${error.message}`);
+      $('#page').innerHTML = loading('测试台数据加载失败');
+    }
+  }
+
   /* ---------- 事件绑定 ---------- */
 
   function bindView() {
@@ -827,6 +903,71 @@
     if (newBtn) newBtn.addEventListener('click', () => { openDrawer(editorHtml(null)); bindEditor(null); });
     const reloadReleases = $('#reloadReleases');
     if (reloadReleases) reloadReleases.addEventListener('click', async () => { await refreshPrompts(); render(); });
+
+    // Prompt 测试台
+    const loadSelectedCase = caseId => {
+      const selected = state.testCases.find(item => item.id === caseId);
+      if (!selected) return;
+      state.testForm = {
+        ...state.testForm, caseId: selected.id, name: selected.name, role: selected.role,
+        jd: selected.jd, resume: selected.resume, extra: selected.extra || ''
+      };
+      render();
+    };
+    const caseSelect = $('#test-caseId');
+    if (caseSelect) caseSelect.addEventListener('change', () => {
+      captureTestForm();
+      if (caseSelect.value) loadSelectedCase(caseSelect.value);
+    });
+    $$('[data-testcase-load]').forEach(btn => btn.addEventListener('click', () => loadSelectedCase(btn.dataset.testcaseLoad)));
+    $$('[data-testcase-delete]').forEach(btn => btn.addEventListener('click', async () => {
+      if (!window.confirm('确认删除这个测试案例？完整测试输入将从服务端移除。')) return;
+      try {
+        await api(`/api/test-cases/${encodeURIComponent(btn.dataset.testcaseDelete)}`, { method: 'DELETE' });
+        if (state.testForm.caseId === btn.dataset.testcaseDelete) state.testForm.caseId = '';
+        toast('测试案例已删除');
+        await loadTests();
+      } catch (error) { toast(error.message, true); }
+    }));
+    const saveTestCase = $('#saveTestCase');
+    if (saveTestCase) saveTestCase.addEventListener('click', async () => {
+      const form = captureTestForm();
+      if (!form.role.trim() || !form.jd.trim() || !form.resume.trim()) return toast('请填写目标岗位、JD 和测试简历', true);
+      if (!window.confirm('保存后，完整 JD、简历与补充信息会持久化到服务端。确认保存？')) return;
+      saveTestCase.disabled = true;
+      try {
+        const data = await api('/api/test-cases', { method: 'POST', body: form });
+        state.testForm.caseId = data.item.id;
+        toast('测试案例已保存');
+        await loadTests();
+      } catch (error) { toast(error.message, true); }
+      finally { saveTestCase.disabled = false; }
+    });
+    const runPromptTest = $('#runPromptTest');
+    if (runPromptTest) runPromptTest.addEventListener('click', async () => {
+      const form = captureTestForm();
+      if (!form.promptId) return toast('请选择目标 Prompt', true);
+      if (!form.role.trim() || !form.jd.trim() || !form.resume.trim()) return toast('请填写目标岗位、JD 和测试简历', true);
+      runPromptTest.disabled = true;
+      runPromptTest.textContent = '正在测试…';
+      try {
+        const data = await api(`/api/prompts/${encodeURIComponent(form.promptId)}/test`, {
+          method: 'POST', body: { ...form, variants: ['published', 'draft'] }
+        });
+        state.testResult = data;
+        toast('草稿与生产对比完成');
+      } catch (error) {
+        if (error.payload && error.payload.results) state.testResult = error.payload;
+        toast(`测试失败：${error.message}`, true);
+      }
+      try {
+        const runs = await api('/api/prompt-tests?limit=50');
+        state.testRuns = runs.items || [];
+      } catch (error) { showConnError(`测试记录刷新失败：${error.message}`); }
+      render();
+    });
+    const reloadTests = $('#reloadTests');
+    if (reloadTests) reloadTests.addEventListener('click', () => { captureTestForm(); loadTests(); });
 
     // 变更记录
     const reloadChanges = $('#reloadChanges');

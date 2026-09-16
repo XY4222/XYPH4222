@@ -108,6 +108,96 @@ async function handleAnalyze(req, res) {
   }
 }
 
+function mockPromptTestResult(variant, resolved) {
+  if (process.env.PROMPT_TEST_MOCK_FAIL === 'true') {
+    throw Object.assign(new Error(`${variant} 模拟调用失败`), { code: 'PROMPT_TEST_MOCK_FAILED', statusCode: 502 });
+  }
+  const targetContent = String(resolved.target?.snapshot?.content || '');
+  return {
+    analysis: {
+      duties: ['测试岗位职责'], hardRequirements: ['测试硬性要求'], implicit: ['测试隐性要求'], keywords: ['测试'],
+      capabilities: [['Prompt 测试', '高', variant]], dimensions: [['测试维度', 80]],
+      score: variant === 'draft' ? 82 : 76, scoreSummary: `${variant} 模拟结果`, scoreDescription: '仅用于自动化验证',
+      issues: [], matches: [['测试要求', targetContent.slice(0, 120), '中', '否', '无']], questions: [],
+      comparisons: [], interview: [], evidence: [], risks: [], intro: '测试自我介绍', highestRisk: '无',
+      finalResume: `${variant}｜${targetContent}`
+    },
+    model: 'prompt-test-mock', usage: { prompt_tokens: 120, completion_tokens: 80, total_tokens: 200 }, attempts: 1
+  };
+}
+
+async function handlePromptTest(req, res, promptId) {
+  const parsed = await readBody(req, ADMIN_LIMIT);
+  const body = parsed && typeof parsed === 'object' ? parsed : {};
+  const prompt = store.getPrompt(promptId);
+  if (!prompt) return send(res, 404, { error: 'Prompt 不存在', code: 'NOT_FOUND' });
+  const variants = Array.isArray(body.variants) && body.variants.length
+    ? [...new Set(body.variants.filter(item => item === 'draft' || item === 'published'))]
+    : ['published', 'draft'];
+  if (!variants.length) {
+    return send(res, 400, { error: '至少选择一个有效测试版本', code: 'INVALID_TEST_VARIANTS' });
+  }
+  const settings = store.getSettings();
+  const input = {
+    role: String(body.role || '').trim().slice(0, 100), industry: String(body.industry || '').trim().slice(0, 100),
+    company: String(body.company || '').slice(0, 100), stage: String(body.stage || '').slice(0, 100),
+    jd: String(body.jd || '').trim(), resume: String(body.resume || '').trim(),
+    extra: String(body.extra || '').trim()
+  };
+  if (!input.role || !input.jd || !input.resume) {
+    return send(res, 400, { error: '缺少目标岗位、JD 或测试简历', code: 'BAD_REQUEST' });
+  }
+  if (input.jd.length > BODY_LIMIT || input.resume.length > BODY_LIMIT || input.extra.length > 10000) {
+    return send(res, 413, { error: '测试输入过长：JD/简历各最多 120000 字符，补充信息最多 10000 字符', code: 'PROMPT_TEST_INPUT_TOO_LARGE' });
+  }
+  const results = {};
+
+  for (const variant of variants) {
+    const started = Date.now();
+    try {
+      const resolved = store.buildPromptConfigForTest(promptId, variant);
+      const result = process.env.NODE_ENV === 'test' && process.env.PROMPT_TEST_MOCK === 'true'
+        ? mockPromptTestResult(variant, resolved)
+        : await analyzeResume({ ...input, promptConfig: resolved.config }, { settings });
+      const latencyMs = Date.now() - started;
+      const cost = Number(store.costOf(result.usage, settings).toFixed(6));
+      results[variant] = {
+        ok: true, variant, analysis: result.analysis, model: result.model, usage: result.usage,
+        attempts: result.attempts, latencyMs, cost,
+        promptConfig: { applied: resolved.config.length, truncated: resolved.truncated, dropped: resolved.dropped }
+      };
+      store.appendPromptTest({
+        promptId: prompt.id, promptName: prompt.name, variant, ok: true, actor: req.auth.username,
+        model: result.model, usage: result.usage, latencyMs, cost, role: input.role,
+        inputChars: input.jd.length + input.resume.length, caseId: body.caseId || null
+      });
+    } catch (error) {
+      const latencyMs = Date.now() - started;
+      results[variant] = { ok: false, variant, error: error.message, code: error.code || 'PROMPT_TEST_FAILED', latencyMs };
+      store.appendPromptTest({
+        promptId: prompt.id, promptName: prompt.name, variant, ok: false, actor: req.auth.username,
+        code: error.code || 'PROMPT_TEST_FAILED', latencyMs, role: input.role,
+        inputChars: input.jd.length + input.resume.length, caseId: body.caseId || null
+      });
+    }
+  }
+
+  const successCount = Object.values(results).filter(item => item.ok).length;
+  const bothSucceeded = results.published?.ok === true && results.draft?.ok === true;
+  const publishedResume = results.published?.analysis?.finalResume || '';
+  const draftResume = results.draft?.analysis?.finalResume || '';
+  const comparison = {
+    bothSucceeded,
+    finalResumeChanged: bothSucceeded ? publishedResume !== draftResume : null,
+    scoreDelta: bothSucceeded ? Number(results.draft.analysis.score || 0) - Number(results.published.analysis.score || 0) : null,
+    latencyDeltaMs: bothSucceeded ? Number(results.draft.latencyMs || 0) - Number(results.published.latencyMs || 0) : null,
+    costDelta: bothSucceeded ? Number((Number(results.draft.cost || 0) - Number(results.published.cost || 0)).toFixed(6)) : null
+  };
+  const failures = Object.values(results).filter(item => !item.ok);
+  const status = successCount ? 200 : failures.length && failures.every(item => item.code === 'NO_PUBLISHED_VERSION') ? 409 : 502;
+  return send(res, status, { prompt: store.summarize(prompt), results, comparison });
+}
+
 const routes = {
   'GET /api/health': (req, res) => send(res, 200, { ok: true, at: new Date().toISOString() }),
 
@@ -194,6 +284,8 @@ const routes = {
     send(res, 200, result);
   },
 
+  'POST /api/prompts/:id/test': async (req, res, url, params) => handlePromptTest(req, res, params.id),
+
   'DELETE /api/prompts/:id': (req, res, url, params) => {
     if (!store.removePrompt(params.id, req.auth.username)) return send(res, 404, { error: 'Prompt 不存在' });
     send(res, 200, { ok: true });
@@ -227,6 +319,22 @@ const routes = {
 
   'GET /api/logs/stats': (req, res, url) => send(res, 200, store.logStats(Number(url.searchParams.get('days') || 7))),
 
+  'GET /api/test-cases': (req, res) => send(res, 200, { items: store.listTestCases() }),
+
+  'POST /api/test-cases': async (req, res) => {
+    const body = await readBody(req, ADMIN_LIMIT);
+    send(res, 201, { item: store.createTestCase(body, req.auth.username) });
+  },
+
+  'DELETE /api/test-cases/:id': (req, res, url, params) => {
+    if (!store.removeTestCase(params.id, req.auth.username)) return send(res, 404, { error: '测试案例不存在' });
+    send(res, 200, { ok: true });
+  },
+
+  'GET /api/prompt-tests': (req, res, url) => send(res, 200, {
+    items: store.listPromptTests(url.searchParams.get('promptId'), Number(url.searchParams.get('limit') || 50))
+  }),
+
   'POST /api/logs/prune': (req, res) => send(res, 200, { kept: store.pruneLogs() }),
 
   'GET /api/settings': (req, res) => send(res, 200, { settings: store.getSettings() }),
@@ -248,6 +356,8 @@ function requiredRole(method, pathname) {
   if (method === 'POST' && pathname === '/api/prompts') return 'editor';
   if (method === 'PUT' && /^\/api\/prompts\/[^/]+$/.test(pathname)) return 'editor';
   if (method === 'POST' && /^\/api\/prompts\/[^/]+\/(toggle|rollback|submit-review)$/.test(pathname)) return 'editor';
+  if (method === 'POST' && /^\/api\/prompts\/[^/]+\/test$/.test(pathname)) return 'editor';
+  if (method === 'POST' && pathname === '/api/test-cases') return 'editor';
   return 'admin';
 }
 

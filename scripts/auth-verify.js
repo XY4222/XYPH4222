@@ -91,6 +91,10 @@ async function main() {
     const viewer = await login('viewer-test', 'Viewer-test-615!');
     check('查看者可以登录', viewer.status === 200 && !!viewer.session);
     check('查看者可以读取总览', (await request('/api/overview', { cookie: viewer.session })).status === 200);
+    check('查看者可以读取测试记录', (await request('/api/prompt-tests', { cookie: viewer.session })).status === 200);
+    check('查看者不能运行 Prompt 测试', (await request('/api/prompts/1/test', {
+      cookie: viewer.session, method: 'POST', body: { role: '测试', jd: 'JD', resume: '简历' }
+    })).status === 403);
     check('查看者不能修改设置', (await request('/api/settings', {
       cookie: viewer.session, method: 'PUT', body: { retries: 1 }
     })).status === 403);
@@ -106,6 +110,13 @@ async function main() {
       body: { content: detail.payload.prompt.content + '\n鉴权测试草稿', actor: '伪造管理员' }
     });
     check('编辑者可以保存草稿', edited.status === 200 && edited.payload.prompt.releaseStatus === 'draft');
+    const testCase = await request('/api/test-cases', {
+      cookie: editor.session, method: 'POST', body: { name: '权限测试', role: '测试', jd: 'JD', resume: '简历' }
+    });
+    check('编辑者可以保存测试案例', testCase.status === 201 && !!testCase.payload.item.id);
+    check('编辑者不能删除测试案例', (await request(`/api/test-cases/${testCase.payload.item.id}`, {
+      cookie: editor.session, method: 'DELETE'
+    })).status === 403);
     check('编辑者不能发布生产', (await request(`/api/prompts/${first.id}/publish`, {
       cookie: editor.session, method: 'POST', body: { actor: '伪造管理员' }
     })).status === 403);
