@@ -33,6 +33,7 @@ const FILES = {
 const LOG_LIMIT = 5000;
 const MAX_TEXT = 60000;
 const TEST_INPUT_MAX = 120000;
+const PROMPT_VARIABLES = new Set(['role', 'jd', 'resume', 'industry', 'company', 'stage', 'extra']);
 
 const DEFAULT_SETTINGS = {
   model: 'deepseek-v4-flash',
@@ -142,6 +143,13 @@ function clip(value, max = MAX_TEXT) {
   return String(value ?? '').slice(0, max);
 }
 
+function validatePromptContent(content) {
+  const names = [...String(content || '').matchAll(/\{\{\s*([a-zA-Z][\w]*)\s*\}\}/g)].map(match => match[1]);
+  const unknown = [...new Set(names.filter(name => !PROMPT_VARIABLES.has(name)))];
+  if (unknown.length) throw Object.assign(new Error(`Prompt 包含未知变量：${unknown.join('、')}`), { statusCode: 400, code: 'UNKNOWN_PROMPT_VARIABLE' });
+  return [...new Set(names)];
+}
+
 function pushVersion(prompt, action, actor, note) {
   const versions = readJson(FILES.versions, []);
   versions.push({
@@ -202,6 +210,8 @@ function createPrompt(input, actor) {
   const prompts = getPrompts();
   const now = new Date().toISOString();
   const stepRaw = input.step === null || input.step === undefined || input.step === '' ? null : Number(input.step);
+  const content = clip(input.content);
+  const variables = validatePromptContent(content);
   const prompt = {
     id: Date.now(),
     stepKey: clip(input.stepKey || 'extension', 40) || 'extension',
@@ -209,7 +219,7 @@ function createPrompt(input, actor) {
     name: clip(input.name, 80) || '未命名 Prompt',
     type: input.type === 'system' ? 'system' : 'task',
     desc: clip(input.desc, 200),
-    content: clip(input.content),
+    content, variables,
     enabled: input.enabled !== false,
     version: 'v1.0',
     revision: 1,
@@ -235,6 +245,7 @@ function updatePrompt(id, input, actor) {
   if (!prompt) return null;
 
   const before = snapshotOf(prompt);
+  if (input.content !== undefined) prompt.variables = validatePromptContent(clip(input.content));
   const stepRaw = input.step === null || input.step === undefined || input.step === '' ? null : Number(input.step);
 
   if (input.name !== undefined) prompt.name = clip(input.name, 80) || prompt.name;
@@ -878,21 +889,25 @@ function assertRegressionGate(prompt) {
  * 把启用中的 Prompt 组装成发给模型的附加指令。
  * 同时回传截断信息——之前前端静默截断到 4000 字符且毫无提示，管理员根本不知道尾部丢了。
  */
-function buildPromptConfig(settingsOverride) {
+function buildPromptConfig(settingsOverride, variables = {}) {
   const settings = { ...getSettings(), ...(settingsOverride || {}) };
   const enabled = getPrompts()
     .filter(p => p.publishedSnapshot && p.publishedSnapshot.enabled && String(p.publishedSnapshot.content || '').trim())
     .map(p => ({ ...p, ...p.publishedSnapshot, version: p.publishedVersion || p.version }));
-  return assemblePromptConfig(enabled, settings);
+  return assemblePromptConfig(enabled, settings, variables);
 }
 
-function assemblePromptConfig(selected, settings) {
+function replacePromptVariables(content, variables) {
+  return String(content).replace(/\{\{\s*([a-zA-Z][\w]*)\s*\}\}/g, (full, name) => Object.prototype.hasOwnProperty.call(variables || {}, name) ? String(variables[name] ?? '') : full);
+}
+
+function assemblePromptConfig(selected, settings, variables = {}) {
   const sorted = selected.sort((a, b) => (a.step ?? 99) - (b.step ?? 99) || a.id - b.id);
   const picked = sorted.slice(0, settings.promptMaxCount);
   const truncated = [];
 
   const config = picked.map(p => {
-    const content = String(p.content);
+    const content = replacePromptVariables(String(p.content), variables);
     if (content.length > settings.promptMaxChars) {
       truncated.push({ id: p.id, name: p.name, originalLength: content.length, sentLength: settings.promptMaxChars });
     }
@@ -908,7 +923,7 @@ function assemblePromptConfig(selected, settings) {
   return { config, truncated, dropped, enabledCount: selected.length };
 }
 
-function buildPromptConfigForTest(id, variant, settingsOverride) {
+function buildPromptConfigForTest(id, variant, settingsOverride, variables = {}) {
   const settings = { ...getSettings(), ...(settingsOverride || {}) };
   const prompts = getPrompts();
   const target = prompts.find(p => String(p.id) === String(id));
@@ -924,7 +939,7 @@ function buildPromptConfigForTest(id, variant, settingsOverride) {
     return snapshot ? { ...prompt, ...snapshot, version: prompt.publishedVersion || prompt.version } : null;
   }).filter(Boolean).filter(prompt => prompt.enabled && String(prompt.content || '').trim());
 
-  const assembled = assemblePromptConfig(selected, settings);
+  const assembled = assemblePromptConfig(selected, settings, variables);
   const targetSnapshot = variant === 'draft' ? snapshotOf(target) : target.publishedSnapshot;
   return { ...assembled, target: { id: target.id, variant, snapshot: targetSnapshot } };
 }
@@ -963,5 +978,6 @@ module.exports = {
   regressionSuiteKey, appendRegression, listRegressions,
   findLog, listFeedback, saveFeedback, updateFeedback, feedbackStats,
   listRules, createRule, updateRule, removeRule, scanRisk,
+  validatePromptContent, replacePromptVariables, PROMPT_VARIABLES,
   overview, costOf, bumpVersion
 };

@@ -347,7 +347,7 @@
     const note = o.lastChange ? `最近变更：${timeAgo(o.lastChange.at)}` : '暂无变更记录';
     return `
       <div class="headline">
-        <div><h1>Prompt 总览</h1><p>统一维护 Prompt 工作副本。编辑只保存草稿，生产版本在发布中心单独控制。</p></div>
+      <div><h1>Prompt 总览</h1><p>统一维护 Prompt 工作副本。编辑只保存草稿，生产版本在发布中心单独控制。支持变量：{{role}}、{{jd}}、{{resume}}、{{industry}}、{{company}}、{{stage}}、{{extra}}。</p></div>
         ${can('editor') ? '<button class="primary" id="newBtn">＋ 新建 Prompt</button>' : ''}
       </div>
       ${truncationNotice()}

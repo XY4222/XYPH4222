@@ -86,7 +86,7 @@ async function handleAnalyze(req, res) {
     }
 
     // Prompt 配置一律以服务端为准，前端不需要自己拼装，也就不会出现浏览器与服务端配置不一致
-    const resolved = store.buildPromptConfig();
+    const resolved = store.buildPromptConfig(undefined, input);
     const payload = { ...input, promptConfig: resolved.config };
 
     const result = await analyzeResume(payload, { settings });
@@ -158,7 +158,7 @@ async function handlePromptTest(req, res, promptId) {
   for (const variant of variants) {
     const started = Date.now();
     try {
-      const resolved = store.buildPromptConfigForTest(promptId, variant);
+        const resolved = store.buildPromptConfigForTest(promptId, variant, undefined, input);
       const result = process.env.NODE_ENV === 'test' && process.env.PROMPT_TEST_MOCK === 'true'
         ? mockPromptTestResult(variant, resolved)
         : await analyzeResume({ ...input, promptConfig: resolved.config }, { settings });
@@ -214,7 +214,7 @@ async function handleRegression(req, res, promptId) {
     for (const variant of ['published', 'draft']) {
       const started = Date.now();
       try {
-        const resolved = store.buildPromptConfigForTest(promptId, variant);
+        const resolved = store.buildPromptConfigForTest(promptId, variant, undefined, input);
         const modelResult = process.env.NODE_ENV === 'test' && process.env.PROMPT_TEST_MOCK === 'true'
           ? mockPromptTestResult(variant, resolved)
           : await analyzeResume({ ...input, promptConfig: resolved.config }, { settings: store.getSettings() });
