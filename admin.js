@@ -550,7 +550,7 @@
     const modelRows = s.byModel.length ? s.byModel.map(item => `<tr><td>${escapeHtml(item.model)}</td><td>${item.total}</td><td>${item.successRate}%</td><td>${fmtLatency(item.avgLatency)}</td><td>${fmtNumber(item.tokens)}</td><td>¥${fmtCost(item.cost)}</td></tr>`).join('') : '';
     const promptRows = s.byPrompt.length ? s.byPrompt.map(item => `<tr><td>${escapeHtml(item.prompt)}</td><td>${item.calls}</td><td>${item.failed}</td><td>${item.truncated}</td><td>${item.dropped}</td></tr>`).join('') : '';
     const promptVersionRows = (s.byPromptVersion || []).length ? s.byPromptVersion.map(item => `<tr><td>${escapeHtml(item.prompt)}</td><td>${escapeHtml(item.version)}</td><td>${item.calls}</td><td>${item.failureRate}%</td><td>${item.retryRate}%</td><td>${fmtLatency(item.avgLatency)}</td><td>¥${fmtCost(item.cost)}</td><td>${item.schemaErrors}</td></tr>`).join('') : '';
-    const alertRows = (s.alerts || []).map(item => `<div class="banner ${item.acknowledged ? 'good' : 'warn'} show"><strong>${escapeHtml(item.scope)}</strong> · ${escapeHtml(item.message)}（${item.calls} 次调用，阈值 ${item.threshold}%） ${item.acknowledged ? `已确认：${escapeHtml(item.acknowledgedBy || '管理员')} · ${fullTime(item.acknowledgedAt)}` : (can('editor') ? `<button class="secondary" style="margin-left:10px;padding:4px 8px" data-alert-ack="${escapeHtml(item.id)}">确认</button>` : '')}</div>`).join('');
+    const alertRows = (s.alerts || []).map(item => `<div class="banner ${item.acknowledged ? 'good' : 'warn'} show"><strong>${escapeHtml(item.scope)}</strong> · ${escapeHtml(item.message)}（${item.calls} 次调用，阈值 ${item.threshold}%） ${item.drilldown ? `<button class="secondary" style="margin-left:10px;padding:4px 8px" data-alert-drill="${escapeHtml(item.id)}" data-alert-prompt="${escapeHtml(item.drilldown.prompt || '')}" data-alert-ok="${escapeHtml(item.drilldown.ok || 'all')}" data-alert-days="${item.drilldown.days || 7}">查看相关日志</button>` : ''}${item.acknowledged ? `已确认：${escapeHtml(item.acknowledgedBy || '管理员')} · ${fullTime(item.acknowledgedAt)}` : (can('editor') ? `<button class="secondary" style="margin-left:10px;padding:4px 8px" data-alert-ack="${escapeHtml(item.id)}">确认</button>` : '')}</div>`).join('');
     const alertHistoryRows = (s.alertHistory || []).map(item => `<tr><td>${escapeHtml(item.scope || '-')}</td><td>${escapeHtml(item.metric || '-')}</td><td>${tag(item.status || 'active', item.status === 'recovered' ? 'green' : item.status === 'acknowledged' ? 'blue' : 'amber')}</td><td>${item.lastRate != null ? `${item.lastRate}%` : '-'}</td><td class="prompt-meta">${fullTime(item.recoveredAt || item.acknowledgedAt || item.lastSeenAt)}</td><td>${escapeHtml(item.acknowledgedBy || '-')}</td></tr>`).join('');
     const slowRows = s.slowest.length ? s.slowest.map(item => `<tr><td>${fullTime(item.at)}</td><td>${fmtLatency(item.latencyMs)}</td><td>${escapeHtml(item.model || '-')}</td><td>${escapeHtml(item.role || '-')}</td><td>${escapeHtml((item.prompts || []).join('、') || '-')}</td><td>${fmtNumber(item.inputChars)}</td><td>${item.attempts || 1}</td></tr>`).join('') : '';
 
@@ -1190,6 +1190,13 @@
 
   // 表格与时间线里的委托事件
   document.addEventListener('click', async event => {
+    const drillButton = event.target.closest('[data-alert-drill]');
+    if (drillButton) {
+      state.logDays = Number(drillButton.dataset.alertDays) || 7;
+      state.logFilter = { ok: drillButton.dataset.alertOk || 'all', model: '', prompt: drillButton.dataset.alertPrompt || '', role: '', minLatency: 0 };
+      await navigate('logs');
+      return;
+    }
     const alertButton = event.target.closest('[data-alert-ack]');
     if (alertButton) {
       alertButton.disabled = true;

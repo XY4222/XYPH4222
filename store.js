@@ -829,12 +829,12 @@ function logStats(days = 7, filters = {}) {
   const alerts = [];
   const context = [days, filters.model || '', filters.prompt || '', filters.role || '', Number(filters.minLatency || 0)].join('|');
   const ackMap = new Map(readAlertStates().map(item => [item.id, item]));
-  const addAlert = (scope, metric, rate, threshold, calls, message) => {
+  const addAlert = (scope, metric, rate, threshold, calls, message, meta = {}) => {
     if (calls >= alertMinCalls && threshold > 0 && rate >= threshold) {
       const roundedRate = Number(rate.toFixed(1));
       const id = alertId(scope, metric, threshold, context);
       const ack = ackMap.get(id);
-      alerts.push({ id, scope, metric, rate: roundedRate, threshold, calls, message, acknowledged: !!ack?.acknowledgedAt, acknowledgedAt: ack?.acknowledgedAt || null, acknowledgedBy: ack?.acknowledgedBy || null });
+      alerts.push({ id, scope, metric, rate: roundedRate, threshold, calls, message, acknowledged: !!ack?.acknowledgedAt, acknowledgedAt: ack?.acknowledgedAt || null, acknowledgedBy: ack?.acknowledgedBy || null, drilldown: { days, prompt: meta.prompt || null, version: meta.version || null, ok: ['failureRate', 'schemaErrorRate'].includes(metric) ? 'false' : 'all' } });
     }
   };
   addAlert('overall', 'failureRate', total ? failed / total * 100 : 0, Number(settings.alertFailureRate), total, `整体失败率 ${total ? (failed / total * 100).toFixed(1) : '0.0'}% 超过阈值`);
@@ -847,9 +847,9 @@ function logStats(days = 7, filters = {}) {
     const schemaRate = item.calls ? item.schemaErrors / item.calls * 100 : 0;
     const retryRate = item.calls ? item.retries / item.calls * 100 : 0;
     const label = `${item.prompt}@${item.version}`;
-    addAlert(label, 'failureRate', failureRate, Number(settings.alertFailureRate), item.calls, `${label} 失败率 ${failureRate.toFixed(1)}% 超过阈值`);
-    addAlert(label, 'schemaErrorRate', schemaRate, Number(settings.alertSchemaErrorRate), item.calls, `${label} Schema 错误率 ${schemaRate.toFixed(1)}% 超过阈值`);
-    addAlert(label, 'retryRate', retryRate, Number(settings.alertRetryRate), item.calls, `${label} 重试率 ${retryRate.toFixed(1)}% 超过阈值`);
+    addAlert(label, 'failureRate', failureRate, Number(settings.alertFailureRate), item.calls, `${label} 失败率 ${failureRate.toFixed(1)}% 超过阈值`, { prompt: item.prompt, version: item.version });
+    addAlert(label, 'schemaErrorRate', schemaRate, Number(settings.alertSchemaErrorRate), item.calls, `${label} Schema 错误率 ${schemaRate.toFixed(1)}% 超过阈值`, { prompt: item.prompt, version: item.version });
+    addAlert(label, 'retryRate', retryRate, Number(settings.alertRetryRate), item.calls, `${label} 重试率 ${retryRate.toFixed(1)}% 超过阈值`, { prompt: item.prompt, version: item.version });
   }
   const alertHistory = syncAlertStates(alerts, context, total >= alertMinCalls);
   return {
