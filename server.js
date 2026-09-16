@@ -421,6 +421,8 @@ const routes = {
 
   'GET /api/alerts': (req, res, url) => send(res, 200, { items: store.listAlertHistory(Number(url.searchParams.get('limit') || 100)) }),
   'POST /api/alerts/:id/ack': (req, res, url, params) => send(res, 200, { item: store.acknowledgeAlert(params.id, req.auth.username) }),
+  'GET /api/alert-notifications': (req, res, url) => send(res, 200, { status: store.alertNotificationStatus(), items: store.listAlertNotifications(Number(url.searchParams.get('limit') || 50)) }),
+  'POST /api/alert-notifications/test': (req, res) => send(res, 202, { item: store.testAlertNotification() }),
 
   'GET /api/test-cases': (req, res, url) => send(res, 200, { items: store.listTestCases(url.searchParams.get('promptId')) }),
 
@@ -465,7 +467,7 @@ const routes = {
 
   'POST /api/logs/prune': (req, res) => send(res, 200, { kept: store.pruneLogs() }),
 
-  'GET /api/settings': (req, res) => send(res, 200, { settings: store.getSettings() }),
+  'GET /api/settings': (req, res) => send(res, 200, { settings: { ...store.getSettings(), alertWebhookConfigured: store.alertNotificationStatus().configured }, notification: store.alertNotificationStatus() }),
 
   'PUT /api/settings': async (req, res) => {
     const body = await readBody(req, ADMIN_LIMIT);
@@ -496,6 +498,7 @@ function requiredRole(method, pathname) {
   if (method === 'POST' && pathname === '/api/rules') return 'editor';
   if (method === 'PUT' && /^\/api\/rules\/[^/]+$/.test(pathname)) return 'editor';
   if (method === 'POST' && /^\/api\/alerts\/[^/]+\/ack$/.test(pathname)) return 'editor';
+  if (method === 'POST' && pathname === '/api/alert-notifications/test') return 'admin';
   return 'admin';
 }
 

@@ -1,5 +1,7 @@
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
+const https = require('https');
 
 /**
  * 服务端持久化层。
@@ -32,7 +34,8 @@ const FILES = {
   templates: path.join(DATA_DIR, 'templates.json'),
   templateVersions: path.join(DATA_DIR, 'template-versions.json'),
   alertAcks: path.join(DATA_DIR, 'alert-ack.json'),
-  alertStates: path.join(DATA_DIR, 'alert-states.json')
+  alertStates: path.join(DATA_DIR, 'alert-states.json'),
+  alertNotifications: path.join(DATA_DIR, 'alert-notifications.json')
 };
 
 const LOG_LIMIT = 5000;
@@ -55,7 +58,8 @@ const DEFAULT_SETTINGS = {
   alertFailureRate: 30,
   alertSchemaErrorRate: 10,
   alertRetryRate: 50,
-  alertMinCalls: 10
+  alertMinCalls: 10,
+  alertNotificationsEnabled: false
 };
 
 const SEED = [
@@ -104,6 +108,7 @@ function ensureData() {
   if (!fs.existsSync(FILES.templateVersions)) writeJson(FILES.templateVersions, []);
   if (!fs.existsSync(FILES.alertAcks)) writeJson(FILES.alertAcks, []);
   if (!fs.existsSync(FILES.alertStates)) writeJson(FILES.alertStates, []);
+  if (!fs.existsSync(FILES.alertNotifications)) writeJson(FILES.alertNotifications, []);
   const templates = readJson(FILES.templates, []);
   const templateVersions = readJson(FILES.templateVersions, []);
   let templatesChanged = false; let templateVersionsChanged = false;
@@ -603,6 +608,9 @@ function getSettings() {
 
 function saveSettings(patch, actor) {
   const next = { ...getSettings(), ...patch };
+  // 这些字段是服务端运行状态，只读，不能被管理端回写到配置文件。
+  delete next.alertWebhookConfigured;
+  delete next.notification;
   const numeric = {
     temperature: [0, 2], maxTokens: [256, 32000], timeoutMs: [5000, 300000], retries: [0, 5],
     promptMaxChars: [200, 60000], promptMaxCount: [1, 50], inputPricePerM: [0, 10000],
@@ -614,6 +622,7 @@ function saveSettings(patch, actor) {
     next[key] = Number.isFinite(value) ? Math.min(Math.max(value, min), max) : DEFAULT_SETTINGS[key];
   }
   next.analyzeEnabled = next.analyzeEnabled !== false;
+  next.alertNotificationsEnabled = next.alertNotificationsEnabled === true || next.alertNotificationsEnabled === 'true';
   next.model = clip(next.model, 60) || DEFAULT_SETTINGS.model;
   writeJson(FILES.settings, next);
   const versions = readJson(FILES.versions, []);
@@ -731,21 +740,119 @@ function acknowledgeAlert(id, actor) {
   return item;
 }
 
+function alertNotificationConfig() {
+  const raw = String(process.env.ALERT_WEBHOOK_URL || '').trim();
+  let parsed = null;
+  try {
+    const candidate = new URL(raw);
+    if (candidate.protocol === 'http:' || candidate.protocol === 'https:') parsed = candidate;
+  } catch {}
+  return {
+    enabled: getSettings().alertNotificationsEnabled === true,
+    configured: !!parsed,
+    scheme: parsed ? parsed.protocol.slice(0, -1) : null
+  };
+}
+
+function listAlertNotifications(limit = 50) {
+  return readJson(FILES.alertNotifications, [])
+    .sort((a, b) => new Date(b.at || 0) - new Date(a.at || 0))
+    .slice(0, Math.min(Math.max(Number(limit) || 50, 1), 200));
+}
+
+function alertNotificationStatus() {
+  const config = alertNotificationConfig();
+  const latest = listAlertNotifications(1)[0] || null;
+  return { enabled: config.enabled, configured: config.configured, scheme: config.scheme, last: latest ? { status: latest.status, type: latest.type, at: latest.at, errorCode: latest.errorCode || null } : null };
+}
+
+function appendAlertNotification(item) {
+  const rows = readJson(FILES.alertNotifications, []);
+  rows.push(item);
+  writeJson(FILES.alertNotifications, rows.slice(-500));
+}
+
+function updateAlertNotification(id, patch) {
+  const rows = readJson(FILES.alertNotifications, []);
+  const item = rows.find(row => row.id === id);
+  if (!item) return;
+  Object.assign(item, patch);
+  writeJson(FILES.alertNotifications, rows);
+}
+
+function postAlertWebhook(payload) {
+  const raw = String(process.env.ALERT_WEBHOOK_URL || '').trim();
+  let target;
+  try {
+    target = new URL(raw);
+    if (!['http:', 'https:'].includes(target.protocol)) throw new Error('Webhook 只支持 HTTP 或 HTTPS');
+  } catch (error) {
+    return Promise.reject(Object.assign(new Error('未配置有效的 ALERT_WEBHOOK_URL'), { code: 'ALERT_WEBHOOK_NOT_CONFIGURED' }));
+  }
+  const body = JSON.stringify(payload);
+  const transport = target.protocol === 'https:' ? https : http;
+  return new Promise((resolve, reject) => {
+    const req = transport.request({
+      protocol: target.protocol, hostname: target.hostname, port: target.port || undefined,
+      path: `${target.pathname}${target.search}`, method: 'POST', timeout: 3000,
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), ...(process.env.ALERT_WEBHOOK_TOKEN ? { Authorization: `Bearer ${String(process.env.ALERT_WEBHOOK_TOKEN).slice(0, 300)}` } : {}) }
+    }, res => {
+      res.resume();
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) resolve({ statusCode: res.statusCode });
+        else reject(Object.assign(new Error(`Webhook 返回 HTTP ${res.statusCode}`), { code: 'ALERT_WEBHOOK_HTTP_ERROR', statusCode: res.statusCode }));
+      });
+    });
+    req.on('timeout', () => req.destroy(Object.assign(new Error('Webhook 请求超时'), { code: 'ALERT_WEBHOOK_TIMEOUT' })));
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
+function dispatchAlertNotification(event) {
+  const config = alertNotificationConfig();
+  if (!config.enabled || !config.configured) return { status: 'skipped', reason: config.enabled ? 'not_configured' : 'disabled' };
+  const id = `notification-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const item = { id, eventId: event.eventId, alertId: event.alertId, type: event.type, scope: event.scope, metric: event.metric, rate: event.rate, threshold: event.threshold, calls: event.calls, status: 'pending', at: new Date().toISOString() };
+  appendAlertNotification(item);
+  const payload = { source: 'resume-expert', event: event.type, alertId: event.alertId, scope: event.scope, metric: event.metric, rate: event.rate, threshold: event.threshold, calls: event.calls, occurredAt: item.at };
+  postAlertWebhook(payload).then(result => updateAlertNotification(id, { status: 'sent', statusCode: result.statusCode, completedAt: new Date().toISOString() }))
+    .catch(error => updateAlertNotification(id, { status: 'failed', errorCode: error.code || 'ALERT_WEBHOOK_FAILED', error: clip(error.message || '通知发送失败', 160), completedAt: new Date().toISOString() }));
+  return { status: 'pending', id };
+}
+
+function testAlertNotification() {
+  const config = alertNotificationConfig();
+  if (!config.enabled) throw Object.assign(new Error('告警通知未启用'), { statusCode: 409, code: 'ALERT_NOTIFICATIONS_DISABLED' });
+  if (!config.configured) throw Object.assign(new Error('服务端未配置有效的 ALERT_WEBHOOK_URL'), { statusCode: 409, code: 'ALERT_WEBHOOK_NOT_CONFIGURED' });
+  const event = { eventId: `test-${Date.now()}`, alertId: 'alert-test', type: 'alert_test', scope: 'test', metric: 'test', rate: 0, threshold: 0, calls: 0 };
+  return dispatchAlertNotification(event);
+}
+
 function syncAlertStates(activeAlerts, context, eligible) {
   const all = readAlertStates();
   const now = new Date().toISOString();
   const activeIds = new Set(activeAlerts.map(item => item.id));
+  const events = [];
   for (const alert of activeAlerts) {
     let state = all.find(item => item.id === alert.id);
+    const wasRecovered = state?.status === 'recovered';
     if (!state) { state = { id: alert.id, scope: alert.scope, metric: alert.metric, threshold: alert.threshold, context, firstSeenAt: now, occurrences: 0 }; all.push(state); }
     state.scope = alert.scope; state.metric = alert.metric; state.threshold = alert.threshold; state.context = context;
     state.lastSeenAt = now; state.lastRate = alert.rate; state.lastCalls = alert.calls; state.occurrences = Number(state.occurrences || 0) + 1; state.status = state.acknowledgedAt ? 'acknowledged' : 'active';
+    if (!state.notificationEventAt || wasRecovered) {
+      state.notificationEventAt = now;
+      events.push({ eventId: `${alert.id}:triggered:${now}`, alertId: alert.id, type: wasRecovered ? 'alert_reactivated' : 'alert_triggered', scope: alert.scope, metric: alert.metric, rate: alert.rate, threshold: alert.threshold, calls: alert.calls });
+    }
   }
   if (eligible) for (const state of all) {
-    if (state.context === context && state.status !== 'recovered' && !activeIds.has(state.id)) { state.status = 'recovered'; state.recoveredAt = now; }
+    if (state.context === context && state.status !== 'recovered' && !activeIds.has(state.id)) {
+      state.status = 'recovered'; state.recoveredAt = now;
+      events.push({ eventId: `${state.id}:recovered:${now}`, alertId: state.id, type: 'alert_recovered', scope: state.scope, metric: state.metric, rate: state.lastRate, threshold: state.threshold, calls: state.lastCalls });
+    }
   }
   writeJson(FILES.alertStates, all);
-  return all;
+  return { states: all, events };
 }
 
 function percentile(sorted, ratio) {
@@ -860,7 +967,9 @@ function logStats(days = 7, filters = {}) {
     addAlert(label, 'schemaErrorRate', schemaRate, Number(settings.alertSchemaErrorRate), item.calls, `${label} Schema 错误率 ${schemaRate.toFixed(1)}% 超过阈值`, { prompt: item.prompt, version: item.version });
     addAlert(label, 'retryRate', retryRate, Number(settings.alertRetryRate), item.calls, `${label} 重试率 ${retryRate.toFixed(1)}% 超过阈值`, { prompt: item.prompt, version: item.version });
   }
-  const alertHistory = syncAlertStates(alerts, context, total >= alertMinCalls);
+  const alertSync = syncAlertStates(alerts, context, total >= alertMinCalls);
+  for (const event of alertSync.events) dispatchAlertNotification(event);
+  const alertHistory = alertSync.states;
   const promptVersionTrends = Object.entries(promptVersionDaily).map(([key, daysByDate]) => {
     const [prompt, ...versionParts] = key.split('@');
     return { prompt, version: versionParts.join('@'), daily: Object.values(daysByDate).sort((a, b) => a.day.localeCompare(b.day)).map(item => ({ ...item, failureRate: Number((item.failed / item.calls * 100).toFixed(1)), schemaErrorRate: Number((item.schemaErrors / item.calls * 100).toFixed(1)), retryRate: Number((item.retries / item.calls * 100).toFixed(1)) })) };
@@ -885,7 +994,7 @@ function logStats(days = 7, filters = {}) {
     filters: { models, prompts },
     alerts: alerts.sort((a, b) => b.rate - a.rate),
     alertHistory: alertHistory.slice().sort((a, b) => new Date(b.lastSeenAt || b.acknowledgedAt || 0) - new Date(a.lastSeenAt || a.acknowledgedAt || 0)).slice(0, 100),
-    settings: { inputPricePerM: settings.inputPricePerM, outputPricePerM: settings.outputPricePerM, alertFailureRate: settings.alertFailureRate, alertSchemaErrorRate: settings.alertSchemaErrorRate, alertRetryRate: settings.alertRetryRate, alertMinCalls: settings.alertMinCalls },
+    settings: { inputPricePerM: settings.inputPricePerM, outputPricePerM: settings.outputPricePerM, alertFailureRate: settings.alertFailureRate, alertSchemaErrorRate: settings.alertSchemaErrorRate, alertRetryRate: settings.alertRetryRate, alertMinCalls: settings.alertMinCalls, alertNotificationsEnabled: settings.alertNotificationsEnabled, alertWebhookConfigured: alertNotificationConfig().configured },
     days
   };
 }
@@ -1251,5 +1360,6 @@ module.exports = {
   listTemplates, updateTemplate, archiveTemplate, listTemplateVersions, rollbackTemplate, createPromptFromTemplate, batchPromptAction,
   dependencyView,
   validatePromptContent, replacePromptVariables, PROMPT_VARIABLES,
-  overview, costOf, bumpVersion, listAlertHistory, acknowledgeAlert
+  overview, costOf, bumpVersion, listAlertHistory, acknowledgeAlert,
+  alertNotificationStatus, listAlertNotifications, testAlertNotification
 };

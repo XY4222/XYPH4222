@@ -7,7 +7,7 @@
     "dev": "node server.js",
     "build": "node build.js",
     "check": "node --check app.js && node --check server.js && node --check deepseek.js && node --check build.js && node --check store.js && node --check auth.js && node --check admin.js",
-    "verify": "node scripts/verify.js && node scripts/release-verify.js && node scripts/auth-verify.js && node scripts/prompt-test-verify.js && node scripts/regression-verify.js && node scripts/monitoring-verify.js && node scripts/feedback-verify.js && node scripts/risk-verify.js && node scripts/variables-verify.js && node scripts/dependencies-verify.js && node scripts/template-batch-verify.js && node scripts/degradation-verify.js",
+    "verify": "node scripts/verify.js && node scripts/release-verify.js && node scripts/auth-verify.js && node scripts/prompt-test-verify.js && node scripts/regression-verify.js && node scripts/monitoring-verify.js && node scripts/alert-notification-verify.js && node scripts/feedback-verify.js && node scripts/risk-verify.js && node scripts/variables-verify.js && node scripts/dependencies-verify.js && node scripts/template-batch-verify.js && node scripts/degradation-verify.js",
     "test": "npm run check && npm run verify"
   }
 }

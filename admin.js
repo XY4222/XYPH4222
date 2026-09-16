@@ -20,6 +20,7 @@
     logDays: 7,
     logFilter: { ok: 'all', model: '', prompt: '', role: '', minLatency: 0 },
     settings: null,
+    notification: null,
     testCases: [],
     testRuns: [],
     regressionRuns: [],
@@ -655,6 +656,8 @@
   function viewSettings() {
     const s = state.settings;
     if (!s) return loading();
+    const notification = state.notification || {};
+    const lastNotification = notification.last;
     return `
       <div class="headline"><div><h1>项目设置</h1><p>运行参数直接作用于线上分析链路，保存后立即生效并记入变更记录。</p></div></div>
       <section class="panel">
@@ -696,9 +699,11 @@
             <div class="field"><label>Schema 错误率告警阈值（%）</label><input id="s-alertSchemaErrorRate" type="number" min="0" max="100" value="${s.alertSchemaErrorRate}" /></div>
             <div class="field"><label>重试率告警阈值（%）</label><input id="s-alertRetryRate" type="number" min="0" max="100" value="${s.alertRetryRate}" /></div>
             <div class="field"><label>触发告警的最少调用数</label><input id="s-alertMinCalls" type="number" min="1" max="10000" value="${s.alertMinCalls}" /></div>
+            <div class="field"><label>Webhook 告警通知</label><select id="s-alertNotificationsEnabled"><option value="true"${s.alertNotificationsEnabled ? ' selected' : ''}>启用</option><option value="false"${s.alertNotificationsEnabled ? '' : ' selected'}>停用</option></select><div class="hint">地址与令牌只从服务端环境变量读取；当前配置：${s.alertWebhookConfigured ? '已配置' : '未配置'}。最近状态：${lastNotification ? `${escapeHtml(lastNotification.status)} · ${fullTime(lastNotification.at)}` : '暂无记录'}</div></div>
           </div>
           <div style="display:flex;justify-content:flex-end;gap:9px;margin-top:6px">
             <button class="secondary" id="reloadSettings">放弃修改</button>
+            ${can('admin') ? '<button class="secondary" id="testAlertNotification">发送测试通知</button>' : ''}
             ${can('admin') ? '<button class="primary" id="saveSettings">保存设置</button>' : ''}
           </div>
         </div>
@@ -967,6 +972,7 @@
     try {
       const data = await api('/api/settings');
       state.settings = data.settings;
+      state.notification = data.notification || null;
       render();
     } catch (error) { showConnError(`设置加载失败：${error.message}`); }
   }
@@ -1193,6 +1199,7 @@
         payload[key] = $('#s-' + key).value;
       });
       payload.analyzeEnabled = $('#s-analyzeEnabled').value === 'true';
+      payload.alertNotificationsEnabled = $('#s-alertNotificationsEnabled').value === 'true';
       try {
         const data = await api('/api/settings', { method: 'PUT', body: payload });
         state.settings = data.settings;
@@ -1203,6 +1210,13 @@
     });
     const reloadSettings = $('#reloadSettings');
     if (reloadSettings) reloadSettings.addEventListener('click', loadSettings);
+    const testAlertNotification = $('#testAlertNotification');
+    if (testAlertNotification) testAlertNotification.addEventListener('click', async () => {
+      testAlertNotification.disabled = true;
+      try { await api('/api/alert-notifications/test', { method: 'POST', body: {} }); toast('测试通知已提交'); }
+      catch (error) { toast(error.message, true); }
+      finally { testAlertNotification.disabled = false; }
+    });
   }
 
   // 表格与时间线里的委托事件
