@@ -1,0 +1,905 @@
+/* 简历专家 · Prompt 管理后台
+ * 数据全部来自服务端（data/ 目录），不再依赖 localStorage。
+ * 页面：Prompt 总览 / 发布中心 / 变更记录 / 运行日志 / 项目设置
+ */
+(function () {
+  'use strict';
+
+  const $ = (sel, root) => (root || document).querySelector(sel);
+  const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
+
+  const state = {
+    route: 'prompts',
+    overview: null,
+    prompts: [],
+    query: { q: '', status: 'all', type: 'all' },
+    changes: [],
+    logs: [],
+    logStats: null,
+    logDays: 7,
+    logFilter: { ok: 'all' },
+    settings: null,
+    currentPrompt: null,
+    currentVersions: []
+  };
+
+  /* ---------- 工具 ---------- */
+
+  function escapeHtml(value) {
+    return String(value == null ? '' : value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  function toast(message, isError) {
+    const el = $('#toast');
+    el.textContent = message;
+    el.classList.toggle('err', !!isError);
+    el.classList.add('show');
+    clearTimeout(toast.timer);
+    toast.timer = setTimeout(() => el.classList.remove('show'), 2400);
+  }
+
+  function showConnError(message) {
+    const el = $('#connBanner');
+    el.textContent = message;
+    el.classList.add('show');
+  }
+
+  function clearConnError() {
+    $('#connBanner').classList.remove('show');
+  }
+
+  async function api(path, options) {
+    const response = await fetch(path, {
+      headers: { 'Content-Type': 'application/json' },
+      ...options,
+      body: options && options.body !== undefined ? JSON.stringify(options.body) : undefined
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || `请求失败（HTTP ${response.status}）`);
+    return payload;
+  }
+
+  function timeAgo(iso) {
+    const diff = Date.now() - new Date(iso).getTime();
+    if (!Number.isFinite(diff)) return '-';
+    if (diff < 60e3) return '刚刚';
+    if (diff < 3600e3) return `${Math.floor(diff / 60e3)} 分钟前`;
+    if (diff < 86400e3) return `${Math.floor(diff / 3600e3)} 小时前`;
+    if (diff < 7 * 86400e3) return `${Math.floor(diff / 86400e3)} 天前`;
+    return new Date(iso).toLocaleDateString('zh-CN');
+  }
+
+  function fullTime(iso) {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '-';
+    const pad = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  const ACTION_TAG = {
+    seed: 'grey', create: 'green', update: 'blue', meta: 'blue', scope: 'amber',
+    status: 'grey', enable: 'green', disable: 'amber', rollback: 'amber', delete: 'red', settings: 'blue',
+    submit_review: 'amber', reject_review: 'red', publish: 'green', production_rollback: 'amber'
+  };
+
+  function tag(text, tone) { return `<span class="tag ${tone || ''}">${escapeHtml(text)}</span>`; }
+
+  function fmtNumber(value) {
+    if (!Number.isFinite(Number(value))) return '-';
+    return Number(value).toLocaleString('zh-CN');
+  }
+
+  function fmtCost(value) {
+    const n = Number(value || 0);
+    if (n === 0) return '0';
+    return n < 0.01 ? n.toFixed(4) : n.toFixed(2);
+  }
+
+  function fmtLatency(ms) {
+    if (!ms) return '-';
+    return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`;
+  }
+
+  /* ---------- 行级 diff（LCS） ---------- */
+
+  function diffLines(before, after) {
+    const a = String(before || '').split('\n');
+    const b = String(after || '').split('\n');
+    const n = a.length;
+    const m = b.length;
+
+    // 超大文本退化为整体替换，避免 O(n*m) 卡死浏览器
+    if (n * m > 400000) {
+      return a.map(line => ({ type: 'del', text: line })).concat(b.map(line => ({ type: 'add', text: line })));
+    }
+
+    const dp = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+    for (let i = n - 1; i >= 0; i--) {
+      for (let j = m - 1; j >= 0; j--) {
+        dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+      }
+    }
+    const out = [];
+    let i = 0;
+    let j = 0;
+    while (i < n && j < m) {
+      if (a[i] === b[j]) { out.push({ type: 'same', text: a[i] }); i++; j++; }
+      else if (dp[i + 1][j] >= dp[i][j + 1]) { out.push({ type: 'del', text: a[i] }); i++; }
+      else { out.push({ type: 'add', text: b[j] }); j++; }
+    }
+    while (i < n) out.push({ type: 'del', text: a[i++] });
+    while (j < m) out.push({ type: 'add', text: b[j++] });
+    return out;
+  }
+
+  /** 折叠未变化的长段落，只保留变更点前后各 2 行 */
+  function renderDiff(before, after) {
+    const rows = diffLines(before, after);
+    const keep = new Array(rows.length).fill(false);
+    rows.forEach((row, index) => {
+      if (row.type === 'same') return;
+      for (let k = Math.max(0, index - 2); k <= Math.min(rows.length - 1, index + 2); k++) keep[k] = true;
+    });
+    const html = [];
+    let skipped = 0;
+    const flush = () => {
+      if (skipped) { html.push(`<div class="row same"><span class="sign">⋯</span><span>（${skipped} 行未变化）</span></div>`); skipped = 0; }
+    };
+    rows.forEach((row, index) => {
+      if (!keep[index]) { skipped++; return; }
+      flush();
+      const sign = row.type === 'add' ? '+' : row.type === 'del' ? '-' : ' ';
+      html.push(`<div class="row ${row.type}"><span class="sign">${sign}</span><span>${escapeHtml(row.text) || '&nbsp;'}</span></div>`);
+    });
+    flush();
+    const added = rows.filter(r => r.type === 'add').length;
+    const removed = rows.filter(r => r.type === 'del').length;
+    if (!added && !removed) return '<div class="empty">两个版本内容完全一致</div>';
+    return `<div class="diff">${html.join('')}</div><p class="prompt-meta" style="margin-top:8px">新增 ${added} 行，删除 ${removed} 行</p>`;
+  }
+
+  /* ---------- 路由 ---------- */
+
+  const ROUTE_TITLE = { prompts: 'Prompt 总览', releases: '发布中心', changes: '变更记录', logs: '运行日志', settings: '项目设置' };
+
+  function setNav(route) {
+    $('#crumb').textContent = ROUTE_TITLE[route] || route;
+    $$('#nav button').forEach(btn => btn.classList.toggle('active', btn.dataset.route === route));
+  }
+
+  async function navigate(route) {
+    state.route = route;
+    setNav(route);
+    render();
+    // 首次进入某个页签时再拉数据，避免启动时打满请求
+    try {
+      if (route === 'changes') await loadChanges();
+      else if (route === 'logs') await loadLogs();
+      else if (route === 'settings') await loadSettings();
+      else if ((route === 'prompts' || route === 'releases') && !state.overview) await loadPrompts();
+    } catch (error) { showConnError(error.message); }
+  }
+
+  function render() {
+    const page = $('#page');
+    if (state.route === 'prompts') page.innerHTML = viewPrompts();
+    else if (state.route === 'releases') page.innerHTML = viewReleases();
+    else if (state.route === 'changes') page.innerHTML = viewChanges();
+    else if (state.route === 'logs') page.innerHTML = viewLogs();
+    else page.innerHTML = viewSettings();
+    bindView();
+    // viewPrompts() 只铺出空表格骨架，行要靠 renderRows 填。切走再切回来时
+    // navigate() 因为 state.overview 已存在不会重新拉数据，这里不补一次，
+    // 表格就会一直是空的（筛选、停留、往返都会踩到）。
+    if (state.route === 'prompts') renderRows();
+  }
+
+  function loading(text) { return `<div class="panel"><div class="loading">${escapeHtml(text || '加载中…')}</div></div>`; }
+
+  /* ---------- 视图：Prompt 总览 ---------- */
+
+  /** 把「会被截断」「会被丢弃」的 Prompt 直接点名——旧版本是静默截断到 4000 字符，没人知道尾部丢了 */
+  function truncationNotice() {
+    const maxChars = (state.overview && state.overview.settings && state.overview.settings.promptMaxChars) || 4000;
+    const maxCount = (state.overview && state.overview.settings && state.overview.settings.promptMaxCount) || 20;
+    const enabled = state.prompts.filter(p => p.enabled).sort((a, b) => (a.step ?? 99) - (b.step ?? 99) || a.id - b.id);
+    const over = state.prompts.filter(p => p.enabled && p.contentLength > maxChars);
+    const dropped = enabled.slice(maxCount);
+    if (!over.length && !dropped.length) return '';
+    const parts = [];
+    if (over.length) parts.push(`以下 Prompt 超过单条 ${maxChars} 字符上限，超出的尾部不会发送给模型：${over.map(p => `${escapeHtml(p.name)}（${p.contentLength} 字）`).join('、')}`);
+    if (dropped.length) parts.push(`启用条数超过 ${maxCount} 条上限，排在末位的 ${dropped.length} 条不会被注入：${dropped.map(p => escapeHtml(p.name)).join('、')}`);
+    return `<div class="banner warn show" style="margin-bottom:20px">${parts.join('<br />')}</div>`;
+  }
+
+  function viewPrompts() {
+    const o = state.overview || { total: 0, enabled: 0, changes7d: 0, coverage: 0, coverageTotal: 8, settings: {} };
+    const note = o.lastChange ? `最近变更：${timeAgo(o.lastChange.at)}` : '暂无变更记录';
+    return `
+      <div class="headline">
+        <div><h1>Prompt 总览</h1><p>统一维护 Prompt 工作副本。编辑只保存草稿，生产版本在发布中心单独控制。</p></div>
+        <button class="primary" id="newBtn">＋ 新建 Prompt</button>
+      </div>
+      ${truncationNotice()}
+      <section class="stats">
+        <div class="stat"><label>流程 Prompt</label><strong>${o.total}</strong><small>对应用户端 8 个步骤</small></div>
+        <div class="stat"><label>已发布</label><strong>${o.published || 0}</strong><small>${o.drafts || 0} 个草稿 · ${o.reviews || 0} 个待审核</small></div>
+        <div class="stat"><label>近 7 天变更</label><strong>${o.changes7d}</strong><small>${escapeHtml(note)}</small></div>
+        <div class="stat"><label>流程覆盖</label><strong>${o.coverage}/${o.coverageTotal}</strong><small class="${o.coverage === o.coverageTotal ? 'good' : 'warn'}">${o.coverage === o.coverageTotal ? '全部步骤已覆盖' : `有 ${o.coverageTotal - o.coverage} 个步骤未启用`}</small></div>
+      </section>
+      <section class="panel">
+        <div class="toolbar">
+          <div class="search"><span>⌕</span><input id="search" placeholder="搜索名称、用途或内容" value="${escapeHtml(state.query.q)}" /></div>
+          <select class="filter" id="statusFilter">
+            <option value="all"${state.query.status === 'all' ? ' selected' : ''}>全部状态</option>
+            <option value="on"${state.query.status === 'on' ? ' selected' : ''}>已启用</option>
+            <option value="off"${state.query.status === 'off' ? ' selected' : ''}>已停用</option>
+          </select>
+          <select class="filter" id="typeFilter">
+            <option value="all"${state.query.type === 'all' ? ' selected' : ''}>全部类型</option>
+            <option value="system"${state.query.type === 'system' ? ' selected' : ''}>系统 Prompt</option>
+            <option value="task"${state.query.type === 'task' ? ' selected' : ''}>任务 Prompt</option>
+          </select>
+        </div>
+        <table class="table">
+          <thead><tr><th>Prompt</th><th>类型</th><th>运行状态</th><th>发布状态</th><th>工作版本</th><th>生产版本</th><th>字数</th><th>最后更新</th><th></th></tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+        <div class="empty" id="empty" style="display:none">没有符合条件的 Prompt</div>
+      </section>`;
+  }
+
+  function renderRows() {
+    const maxChars = (state.overview && state.overview.settings && state.overview.settings.promptMaxChars) || 4000;
+    const list = state.prompts;
+    const body = $('#rows');
+    const empty = $('#empty');
+    if (!body || !empty) return;
+
+    if (!list.length) { body.innerHTML = ''; empty.style.display = 'block'; return; }
+    empty.style.display = 'none';
+
+    body.innerHTML = list.map(p => {
+      const over = p.contentLength > maxChars;
+      const stepTag = p.step ? `步骤 ${p.step}` : '扩展';
+      const release = p.releaseStatus === 'review'
+        ? tag('待审核', 'amber')
+        : p.releaseStatus === 'draft' ? tag('草稿', 'blue') : tag('已发布', 'green');
+      return `<tr>
+        <td>
+          <div class="prompt-name">${tag(stepTag)}${escapeHtml(p.name)}</div>
+          <div class="prompt-meta">${escapeHtml(p.desc || '')}</div>
+        </td>
+        <td>${tag(p.type === 'system' ? '系统' : '任务', p.type === 'system' ? 'blue' : '')}</td>
+        <td><span class="status ${p.enabled ? '' : 'off'}"><span class="dot"></span>${p.enabled ? '已启用' : '已停用'}</span></td>
+        <td>${release}</td>
+        <td><span class="version">${escapeHtml(p.version)}</span></td>
+        <td><span class="version">${escapeHtml(p.publishedVersion || '未发布')}</span></td>
+        <td>${over ? `<span class="tag red" title="超出单条上限 ${maxChars} 字符，超出部分不会发给模型">${p.contentLength} 超限</span>` : `<span class="version">${p.contentLength}</span>`}</td>
+        <td class="prompt-meta">${timeAgo(p.updatedAt)}</td>
+        <td><div class="actions">
+          <button class="iconbtn" data-act="edit" data-id="${p.id}">编辑</button>
+          <button class="iconbtn" data-act="history" data-id="${p.id}">历史</button>
+          <button class="iconbtn" data-act="toggle" data-id="${p.id}" data-enabled="${p.enabled ? 'false' : 'true'}">${p.enabled ? '停用' : '启用'}</button>
+        </div></td>
+      </tr>`;
+    }).join('');
+  }
+
+  /* ---------- 视图：发布中心 ---------- */
+
+  function viewReleases() {
+    const o = state.overview || { published: 0, drafts: 0, reviews: 0 };
+    const pending = state.prompts.filter(p => p.releaseStatus !== 'published');
+    const rows = state.prompts.map(p => {
+      const status = p.releaseStatus === 'review'
+        ? tag('待审核', 'amber')
+        : p.releaseStatus === 'draft' ? tag('草稿', 'blue') : tag('已发布', 'green');
+      let actions = '<span class="prompt-meta">无需操作</span>';
+      if (p.releaseStatus === 'draft') {
+        actions = `<button class="iconbtn" data-act="edit" data-id="${p.id}">编辑</button><button class="iconbtn" data-act="submit-review" data-id="${p.id}">提交审核</button>`;
+      } else if (p.releaseStatus === 'review') {
+        actions = `<button class="iconbtn" data-act="reject-review" data-id="${p.id}">驳回</button><button class="primary" style="padding:6px 10px" data-act="publish" data-id="${p.id}">发布生产</button>`;
+      }
+      return `<tr>
+        <td><div class="prompt-name">${escapeHtml(p.name)}</div><div class="prompt-meta">${escapeHtml(p.desc || '')}</div></td>
+        <td>${status}</td>
+        <td><span class="version">${escapeHtml(p.version)}</span></td>
+        <td><span class="version">${escapeHtml(p.publishedVersion || '未发布')}</span></td>
+        <td class="prompt-meta">${p.publishedAt ? fullTime(p.publishedAt) : '尚未发布'}</td>
+        <td><div class="actions">${actions}<button class="iconbtn" data-act="history" data-id="${p.id}">版本历史</button></div></td>
+      </tr>`;
+    }).join('');
+
+    return `<div class="headline">
+      <div><h1>发布中心</h1><p>草稿不会影响用户请求；审核通过并发布后才替换生产版本。</p></div>
+      <button class="secondary" id="reloadReleases">刷新状态</button>
+    </div>
+    <section class="stats">
+      <div class="stat"><label>已发布</label><strong>${o.published || 0}</strong><small>当前生产版本</small></div>
+      <div class="stat"><label>草稿</label><strong>${o.drafts || 0}</strong><small>尚未提交审核</small></div>
+      <div class="stat"><label>待审核</label><strong>${o.reviews || 0}</strong><small>等待管理员发布</small></div>
+      <div class="stat"><label>待处理</label><strong>${pending.length}</strong><small>${pending.length ? '存在未上线修改' : '生产与工作区一致'}</small></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><div><h2>版本发布队列</h2><p>所有发布和回滚都会写入变更记录</p></div></div>
+      <table class="table"><thead><tr><th>Prompt</th><th>状态</th><th>工作版本</th><th>生产版本</th><th>最近发布</th><th></th></tr></thead><tbody>${rows}</tbody></table>
+    </section>`;
+  }
+
+  /* ---------- 视图：变更记录 ---------- */
+
+  function viewChanges() {
+    if (!state.changes.length) return `<div class="headline"><div><h1>变更记录</h1><p>所有 Prompt 与运行参数的修改轨迹。</p></div></div>${loading('暂无变更记录')}`;
+    const items = state.changes.map(v => {
+      const snap = v.snapshot || {};
+      const detail = v.action === 'update' || v.action === 'create'
+        ? `<div class="tl-note">版本 ${escapeHtml(v.version)} · ${escapeHtml(String(snap.content || '').slice(0, 90))}${String(snap.content || '').length > 90 ? '…' : ''}</div>`
+        : v.note ? `<div class="tl-note">${escapeHtml(v.note)}</div>` : '';
+      return `<div class="tl-item ${v.action}">
+        <div class="tl-body">
+          <div class="tl-top">
+            <div class="tl-title">${escapeHtml(v.promptName)} ${tag(v.actionLabel || v.action, ACTION_TAG[v.action])}${v.action === 'rollback' ? tag('回滚', 'amber') : ''}</div>
+            <div class="tl-time" title="${fullTime(v.at)}">${fullTime(v.at)}</div>
+          </div>
+          ${detail}
+          <div class="tl-note">操作人：${escapeHtml(v.actor || '管理员')}${v.promptId ? `　·　<a class="iconbtn" style="padding:2px 6px" href="#" data-act="open-versions" data-id="${v.promptId}">查看该 Prompt 版本历史</a>` : ''}</div>
+        </div>
+      </div>`;
+    }).join('');
+    return `
+      <div class="headline"><div><h1>变更记录</h1><p>所有 Prompt 与运行参数的修改轨迹，按时间倒序。</p></div>
+        <button class="secondary" id="reloadChanges">刷新</button></div>
+      <section class="panel"><div class="inner" style="padding:20px 18px"><div class="timeline">${items}</div></div></section>`;
+  }
+
+  /* ---------- 视图：运行日志 ---------- */
+
+  function dailyChart(daily) {
+    if (!daily.length) return '<div class="empty">所选区间内没有调用记录</div>';
+    const width = 720;
+    const height = 170;
+    const pad = { top: 14, right: 12, bottom: 26, left: 40 };
+    const innerW = width - pad.left - pad.right;
+    const innerH = height - pad.top - pad.bottom;
+    const max = Math.max(1, ...daily.map(d => d.total));
+    const slot = innerW / daily.length;
+    const barW = Math.max(3, Math.min(26, slot * 0.55));
+
+    const bars = daily.map((d, i) => {
+      const x = pad.left + slot * i + (slot - barW) / 2;
+      const totalH = (d.total / max) * innerH;
+      const failH = (d.failed / max) * innerH;
+      const y = pad.top + innerH - totalH;
+      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${totalH.toFixed(1)}" rx="3" fill="#93b4f5"></rect>
+        ${failH ? `<rect x="${x.toFixed(1)}" y="${(pad.top + innerH - failH).toFixed(1)}" width="${barW.toFixed(1)}" height="${failH.toFixed(1)}" rx="3" fill="#d4717c"></rect>` : ''}`;
+    }).join('');
+
+    const labels = daily.map((d, i) => {
+      if (daily.length > 12 && i % Math.ceil(daily.length / 8) !== 0) return '';
+      const x = pad.left + slot * i + slot / 2;
+      return `<text x="${x.toFixed(1)}" y="${height - 8}" font-size="10" fill="#8490a0" text-anchor="middle">${escapeHtml(d.day.slice(5))}</text>`;
+    }).join('');
+
+    const ticks = [0, 0.5, 1].map(ratio => {
+      const y = pad.top + innerH - ratio * innerH;
+      return `<line x1="${pad.left}" y1="${y}" x2="${width - pad.right}" y2="${y}" stroke="#eef1f6" stroke-width="1"></line>
+        <text x="${pad.left - 6}" y="${y + 3}" font-size="10" fill="#8490a0" text-anchor="end">${Math.round(max * ratio)}</text>`;
+    }).join('');
+
+    return `<svg class="chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="每日调用量">
+        ${ticks}${bars}${labels}
+      </svg>
+      <div class="legend"><span><i style="background:#93b4f5"></i>总调用</span><span><i style="background:#d4717c"></i>失败</span></div>`;
+  }
+
+  function viewLogs() {
+    const s = state.logStats;
+    if (!s) return `<div class="headline"><div><h1>运行日志</h1><p>每次分析的模型、耗时、token、成本与错误分布。</p></div></div>${loading()}`;
+
+    const okRate = s.total ? ((s.total - s.failed) / s.total * 100).toFixed(1) : '—';
+    const errorBars = s.byCode.length
+      ? s.byCode.map(c => {
+          const ratio = s.failed ? (c.count / s.failed) * 100 : 0;
+          return `<div class="bar-row"><span class="name">${escapeHtml(c.label)}</span><span class="bar"><i style="width:${ratio.toFixed(1)}%"></i></span><span class="num">${c.count}</span></div>`;
+        }).join('')
+      : '<div class="empty" style="padding:20px">区间内没有失败调用</div>';
+
+    const rows = state.logs.map(l => {
+      const status = l.ok ? tag('成功', 'green') : tag('失败', 'red');
+      const usage = l.usage ? `${fmtNumber(l.usage.prompt_tokens)} / ${fmtNumber(l.usage.completion_tokens)}` : '—';
+      const notes = [];
+      if ((l.truncated || []).length) notes.push(`<span class="tag amber">截断 ${l.truncated.length} 条</span>`);
+      if ((l.dropped || []).length) notes.push(`<span class="tag amber">超量丢弃 ${l.dropped.length} 条</span>`);
+      if ((l.attempts || 1) > 1) notes.push(`<span class="tag grey">重试 ${l.attempts} 次</span>`);
+      return `<tr>
+        <td class="prompt-meta" title="${fullTime(l.at)}">${timeAgo(l.at)}</td>
+        <td>${status}</td>
+        <td class="prompt-meta">${escapeHtml(l.model || '-')}</td>
+        <td class="prompt-meta">${escapeHtml(l.role || '—')}</td>
+        <td class="version">${fmtLatency(l.latencyMs)}</td>
+        <td class="version" title="输入 / 输出 token">${usage}</td>
+        <td class="version">${l.usage ? fmtCost(l.cost) : '—'}</td>
+        <td>${l.code ? `<span class="tag red" title="${escapeHtml(l.error || '')}">${escapeHtml(l.code)}</span>` : '<span class="prompt-meta">—</span>'}</td>
+        <td class="prompt-meta">${notes.join('') || '—'}</td>
+      </tr>`;
+    }).join('');
+
+    return `
+      <div class="headline">
+        <div><h1>运行日志</h1><p>每次分析的模型、耗时、token、成本与错误分布，数据来自服务端 data/logs.jsonl。</p></div>
+        <div style="display:flex;gap:9px">
+          <select class="filter" id="logDays">
+            ${[1, 7, 30, 90].map(d => `<option value="${d}"${state.logDays === d ? ' selected' : ''}>近 ${d} 天</option>`).join('')}
+          </select>
+          <button class="secondary" id="reloadLogs">刷新</button>
+          <button class="secondary" id="pruneLogs">清理过期</button>
+        </div>
+      </div>
+      <section class="stats">
+        <div class="stat"><label>总调用</label><strong>${fmtNumber(s.total)}</strong><small>近 ${s.days} 天</small></div>
+        <div class="stat"><label>成功率</label><strong>${okRate}%</strong><small class="${s.failed === 0 ? 'good' : 'warn'}">失败 ${s.failed} 次</small></div>
+        <div class="stat"><label>平均耗时</label><strong>${fmtLatency(s.avgLatency)}</strong><small>P95 ${fmtLatency(s.p95Latency)}</small></div>
+        <div class="stat"><label>Token 用量</label><strong>${fmtNumber(s.tokens)}</strong><small>${s.truncatedCalls ? `<span class="warn">${s.truncatedCalls} 次调用发生截断</span>` : '无截断事件'}</small></div>
+        <div class="stat"><label>预估成本</label><strong>${fmtCost(s.cost)}</strong><small>¥ · 按项目设置单价折算</small></div>
+      </section>
+      <div class="grid2">
+        <section class="panel">
+          <div class="panel-head"><div><h2>每日调用量</h2><p>失败调用叠加显示</p></div></div>
+          <div style="padding:12px 16px 6px">${dailyChart(s.daily)}</div>
+        </section>
+        <section class="panel">
+          <div class="panel-head"><div><h2>失败原因分布</h2><p>共 ${s.failed} 次失败</p></div></div>
+          <div style="padding:14px 18px">${errorBars}</div>
+        </section>
+      </div>
+      <section class="panel">
+        <div class="panel-head">
+          <div><h2>调用明细</h2><p>点击「刷新」或切换区间重新拉取</p></div>
+          <div class="tabs" style="border:0;background:none;padding:0">
+            <button data-logfilter="all" class="${state.logFilter.ok === 'all' ? 'active' : ''}">全部</button>
+            <button data-logfilter="true" class="${state.logFilter.ok === 'true' ? 'active' : ''}">仅成功</button>
+            <button data-logfilter="false" class="${state.logFilter.ok === 'false' ? 'active' : ''}">仅失败</button>
+          </div>
+        </div>
+        ${state.logs.length ? `<table class="table">
+          <thead><tr><th>时间</th><th>状态</th><th>模型</th><th>岗位</th><th>耗时</th><th>Token 入/出</th><th>成本</th><th>错误码</th><th>备注</th></tr></thead>
+          <tbody>${rows}</tbody></table>` : '<div class="empty">该区间内没有调用记录</div>'}
+      </section>`;
+  }
+
+  /* ---------- 视图：项目设置 ---------- */
+
+  function viewSettings() {
+    const s = state.settings;
+    if (!s) return loading();
+    return `
+      <div class="headline"><div><h1>项目设置</h1><p>运行参数直接作用于线上分析链路，保存后立即生效并记入变更记录。</p></div></div>
+      <section class="panel">
+        <div class="panel-head"><div><h2>模型与请求</h2><p>原先硬编码在 deepseek.js 中的参数</p></div></div>
+        <div style="padding:18px">
+          <div class="grid2">
+            <div class="field"><label>模型</label><input id="s-model" value="${escapeHtml(s.model)}" /></div>
+            <div class="field"><label>Temperature（0–2）</label><input id="s-temperature" type="number" step="0.1" min="0" max="2" value="${s.temperature}" /></div>
+            <div class="field"><label>Max tokens（256–32000）</label><input id="s-maxTokens" type="number" min="256" max="32000" value="${s.maxTokens}" /></div>
+            <div class="field"><label>单次超时（毫秒）</label><input id="s-timeoutMs" type="number" min="5000" max="300000" value="${s.timeoutMs}" /></div>
+            <div class="field"><label>重试次数（0–5）</label><input id="s-retries" type="number" min="0" max="5" value="${s.retries}" /></div>
+            <div class="field"><label>分析总开关</label>
+              <select id="s-analyzeEnabled">
+                <option value="true"${s.analyzeEnabled ? ' selected' : ''}>正常运行</option>
+                <option value="false"${s.analyzeEnabled ? '' : ' selected'}>暂停所有分析请求</option>
+              </select>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><div><h2>Prompt 注入上限</h2><p>超出上限的内容不会发给模型，后台会明确标注</p></div></div>
+        <div style="padding:18px">
+          <div class="grid2">
+            <div class="field"><label>单条 Prompt 最大字符数</label><input id="s-promptMaxChars" type="number" min="200" max="60000" value="${s.promptMaxChars}" />
+              <div class="hint"><span>超出部分会被截断，列表页会显示「超限」标记</span></div></div>
+            <div class="field"><label>每次注入的最大条数</label><input id="s-promptMaxCount" type="number" min="1" max="50" value="${s.promptMaxCount}" /></div>
+          </div>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><div><h2>成本与留存</h2><p>单价仅用于日志页的成本估算</p></div></div>
+        <div style="padding:18px">
+          <div class="grid2">
+            <div class="field"><label>输入单价（元 / 百万 token）</label><input id="s-inputPricePerM" type="number" step="0.1" min="0" value="${s.inputPricePerM}" /></div>
+            <div class="field"><label>输出单价（元 / 百万 token）</label><input id="s-outputPricePerM" type="number" step="0.1" min="0" value="${s.outputPricePerM}" /></div>
+            <div class="field"><label>日志保留天数（1–365）</label><input id="s-logRetentionDays" type="number" min="1" max="365" value="${s.logRetentionDays}" /></div>
+          </div>
+          <div style="display:flex;justify-content:flex-end;gap:9px;margin-top:6px">
+            <button class="secondary" id="reloadSettings">放弃修改</button>
+            <button class="primary" id="saveSettings">保存设置</button>
+          </div>
+        </div>
+      </section>`;
+  }
+
+  /* ---------- 抽屉：编辑 ---------- */
+
+  function openDrawer(html, wide) {
+    const body = $('#drawerBody');
+    body.className = 'drawer' + (wide ? ' wide' : '');
+    body.innerHTML = html;
+    $('#drawer').classList.add('open');
+  }
+
+  function closeDrawer() {
+    $('#drawer').classList.remove('open');
+    $('#drawerBody').innerHTML = '';
+  }
+
+  function editorHtml(prompt) {
+    const maxChars = (state.overview && state.overview.settings && state.overview.settings.promptMaxChars) || 4000;
+    const isEdit = !!prompt;
+    const p = prompt || { name: '', type: 'task', desc: '', content: '', enabled: true, step: null, version: 'v1.0' };
+    return `
+      <div class="drawer-head">
+        <div>
+          <h2>${isEdit ? '编辑 Prompt' : '新建 Prompt'}</h2>
+          <p class="prompt-meta" id="drawerMeta">${isEdit ? `当前工作版本 ${escapeHtml(p.version)} · 保存后成为草稿，不会立即影响生产` : '新 Prompt 默认保存为草稿，发布前不会进入分析链路'}</p>
+        </div>
+        <button class="close" data-act="close-drawer">×</button>
+      </div>
+      <form id="editorForm">
+        <div class="field"><label>名称</label><input id="f-name" maxlength="80" required value="${escapeHtml(p.name)}" /></div>
+        <div class="grid2">
+          <div class="field"><label>类型</label>
+            <select id="f-type">
+              <option value="system"${p.type === 'system' ? ' selected' : ''}>系统 Prompt</option>
+              <option value="task"${p.type === 'task' ? ' selected' : ''}>任务 Prompt</option>
+            </select>
+          </div>
+          <div class="field"><label>归属步骤</label>
+            <select id="f-step">
+              <option value="">扩展（全局附加）</option>
+              ${[1, 2, 3, 4, 5, 6, 7, 8].map(n => `<option value="${n}"${Number(p.step) === n ? ' selected' : ''}>步骤 ${n}</option>`).join('')}
+            </select>
+          </div>
+        </div>
+        <div class="field"><label>用途说明</label><input id="f-desc" maxlength="200" value="${escapeHtml(p.desc || '')}" /></div>
+        <div class="field">
+          <label>Prompt 内容</label>
+          <textarea id="f-content" required>${escapeHtml(p.content || '')}</textarea>
+          <div class="hint" id="charHint"><span>超出 ${maxChars} 字符的部分不会发送给模型</span><span id="charCount">0 / ${maxChars}</span></div>
+        </div>
+        <div class="field"><label>状态</label>
+          <select id="f-enabled">
+            <option value="true"${p.enabled ? ' selected' : ''}>启用（发布后生效）</option>
+            <option value="false"${p.enabled ? '' : ' selected'}>停用</option>
+          </select>
+        </div>
+        <div class="field"><label>变更备注（可选）</label><input id="f-note" maxlength="200" placeholder="例如：收紧事实边界，禁止把 Demo 写为商业项目" /></div>
+        <div class="drawer-foot">
+          <button type="button" class="secondary" data-act="close-drawer">取消</button>
+          <button type="submit" class="primary">保存草稿</button>
+        </div>
+      </form>`;
+  }
+
+  function bindEditor(prompt) {
+    const maxChars = (state.overview && state.overview.settings && state.overview.settings.promptMaxChars) || 4000;
+    const textarea = $('#f-content');
+    const counter = $('#charCount');
+    const hint = $('#charHint');
+    const sync = () => {
+      const len = textarea.value.length;
+      counter.textContent = `${len} / ${maxChars}`;
+      hint.classList.toggle('over', len > maxChars);
+    };
+    textarea.addEventListener('input', sync);
+    sync();
+
+    $('#editorForm').addEventListener('submit', async event => {
+      event.preventDefault();
+      const payload = {
+        name: $('#f-name').value.trim(),
+        type: $('#f-type').value,
+        step: $('#f-step').value === '' ? null : Number($('#f-step').value),
+        stepKey: $('#f-step').value === '' ? 'extension' : ['input', 'jd', 'diagnosis', 'match', 'questions', 'optimize', 'interview', 'export'][Number($('#f-step').value) - 1],
+        desc: $('#f-desc').value.trim(),
+        content: $('#f-content').value,
+        enabled: $('#f-enabled').value === 'true',
+        note: $('#f-note').value.trim(),
+        actor: '管理员'
+      };
+      try {
+        if (prompt) await api(`/api/prompts/${prompt.id}`, { method: 'PUT', body: payload });
+        else await api('/api/prompts', { method: 'POST', body: payload });
+        closeDrawer();
+        await refreshPrompts();
+        toast(prompt ? '草稿已保存，生产版本未变化' : 'Prompt 草稿已创建');
+      } catch (error) { toast(error.message, true); }
+    });
+  }
+
+  /* ---------- 抽屉：版本历史 ---------- */
+
+  async function openHistory(promptId) {
+    openDrawer(loading('加载版本历史…'), true);
+    try {
+      const { prompt, versions } = await api(`/api/prompts/${promptId}`);
+      state.currentPrompt = prompt;
+      state.currentVersions = versions;
+      openDrawer(historyHtml(prompt, versions), true);
+      bindHistory();
+    } catch (error) {
+      closeDrawer();
+      toast(error.message, true);
+    }
+  }
+
+  function historyHtml(prompt, versions) {
+    const rows = versions.map((v, index) => {
+      const isCurrent = index === 0;
+      return `<div class="vrow ${isCurrent ? 'current' : ''}">
+        <span class="vver">${escapeHtml(v.version)}</span>
+        <span class="vmeta">${tag(v.actionLabel || v.action, ACTION_TAG[v.action])}${fullTime(v.at)} · ${escapeHtml(v.actor || '管理员')}${v.note ? ` · ${escapeHtml(v.note)}` : ''}${isCurrent ? ' · 当前版本' : ''}</span>
+        <span class="actions">
+          ${isCurrent ? '' : `<button class="iconbtn" data-act="diff" data-vid="${v.vid}" data-index="${index}">与当前对比</button>`}
+          ${isCurrent ? '' : `<button class="iconbtn" data-act="restore" data-vid="${v.vid}" data-version="${escapeHtml(v.version)}">恢复为草稿</button>`}
+          ${isCurrent ? '' : `<button class="iconbtn" data-act="production-rollback" data-vid="${v.vid}" data-version="${escapeHtml(v.version)}">回滚生产</button>`}
+        </span>
+      </div>`;
+    }).join('');
+
+    return `
+      <div class="drawer-head">
+        <div>
+          <h2>版本历史</h2>
+          <p class="prompt-meta">${escapeHtml(prompt.name)} · 工作版本 ${escapeHtml(prompt.version)} · 生产版本 ${escapeHtml(prompt.publishedVersion || '未发布')} · 共 ${versions.length} 个记录</p>
+        </div>
+        <button class="close" data-act="close-drawer">×</button>
+      </div>
+      <p class="prompt-meta" style="margin-top:-8px">“恢复为草稿”不会影响生产；“回滚生产”会立即生成新的生产版本，但不会删除历史。</p>
+      <div class="vlist" style="margin-top:16px">${rows}</div>
+      <div id="diffArea"></div>
+      <details class="collapse" style="margin-top:16px">
+        <summary>查看当前 Prompt 内容</summary>
+        <div class="inner"><div class="diff"><div class="row same"><span class="sign"> </span><span>${escapeHtml(prompt.content || '').replace(/\n/g, '</span></div><div class="row same"><span class="sign"> </span><span>')}</span></div></div></div>
+      </details>`;
+  }
+
+  function bindHistory() {
+    const area = $('#diffArea');
+    $$('[data-act="diff"]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const index = Number(btn.dataset.index);
+        const target = state.currentVersions.find(v => v.vid === btn.dataset.vid);
+        if (!target || !area) return;
+        area.innerHTML = `<details class="collapse" open style="margin-top:16px">
+          <summary>${escapeHtml(target.version)} → ${escapeHtml(state.currentPrompt.version)} 的内容差异</summary>
+          <div class="inner">${renderDiff(target.snapshot.content, state.currentPrompt.content)}</div>
+        </details>`;
+      });
+    });
+
+    $$('[data-act="restore"]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const version = btn.dataset.version;
+        if (!window.confirm(`确认把 ${version} 恢复为新草稿？\n\n生产版本不会变化。`)) return;
+        try {
+          const result = await api(`/api/prompts/${state.currentPrompt.id}/rollback`, {
+            method: 'POST',
+            body: { vid: btn.dataset.vid, actor: '管理员' }
+          });
+          toast(`已恢复为草稿：${result.rolledBackFrom} → ${result.prompt.version}`);
+          await refreshPrompts();
+          await openHistory(state.currentPrompt.id);
+        } catch (error) { toast(error.message, true); }
+      });
+    });
+
+    $$('[data-act="production-rollback"]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const version = btn.dataset.version;
+        if (!window.confirm(`确认将生产环境回滚到 ${version}？\n\n系统会生成一个新的生产版本，历史不会删除。`)) return;
+        try {
+          const result = await api(`/api/prompts/${state.currentPrompt.id}/production-rollback`, {
+            method: 'POST', body: { vid: btn.dataset.vid, actor: '管理员', note: `生产回滚至 ${version}` }
+          });
+          toast(`生产已回滚：${result.rolledBackFrom || '未发布'} → ${result.prompt.publishedVersion}`);
+          await refreshPrompts();
+          await openHistory(state.currentPrompt.id);
+        } catch (error) { toast(error.message, true); }
+      });
+    });
+  }
+
+  /* ---------- 数据加载 ---------- */
+
+  async function refreshPrompts() {
+    const params = new URLSearchParams({ q: state.query.q, status: state.query.status, type: state.query.type });
+    const [overview, list] = await Promise.all([api('/api/overview'), api(`/api/prompts?${params}`)]);
+    state.overview = overview;
+    state.settings = overview.settings;
+    state.prompts = list.items;
+    clearConnError();
+  }
+
+  async function loadPrompts() {
+    try {
+      await refreshPrompts();
+      render();
+      renderRows();
+    } catch (error) {
+      showConnError(`无法连接到管理接口：${error.message}。请通过 node server.js 启动后访问 /admin。`);
+      $('#page').innerHTML = loading('数据加载失败');
+    }
+  }
+
+  async function loadChanges() {
+    try {
+      const data = await api('/api/changes?limit=120');
+      state.changes = data.items;
+      render();
+    } catch (error) { showConnError(`变更记录加载失败：${error.message}`); }
+  }
+
+  async function loadLogs() {
+    try {
+      const params = new URLSearchParams({ days: String(state.logDays), limit: '200' });
+      if (state.logFilter.ok !== 'all') params.set('ok', state.logFilter.ok);
+      const [stats, logs] = await Promise.all([api(`/api/logs/stats?days=${state.logDays}`), api(`/api/logs?${params}`)]);
+      state.logStats = stats;
+      state.logs = logs.items;
+      render();
+    } catch (error) { showConnError(`运行日志加载失败：${error.message}`); }
+  }
+
+  async function loadSettings() {
+    try {
+      const data = await api('/api/settings');
+      state.settings = data.settings;
+      render();
+    } catch (error) { showConnError(`设置加载失败：${error.message}`); }
+  }
+
+  /* ---------- 事件绑定 ---------- */
+
+  function bindView() {
+    // Prompt 总览
+    const search = $('#search');
+    if (search) {
+      let timer;
+      search.addEventListener('input', () => {
+        state.query.q = search.value;
+        clearTimeout(timer);
+        timer = setTimeout(async () => {
+          await refreshPrompts();
+          renderRows();
+        }, 220);
+      });
+    }
+    const statusFilter = $('#statusFilter');
+    if (statusFilter) statusFilter.addEventListener('change', async () => { state.query.status = statusFilter.value; await refreshPrompts(); renderRows(); });
+    const typeFilter = $('#typeFilter');
+    if (typeFilter) typeFilter.addEventListener('change', async () => { state.query.type = typeFilter.value; await refreshPrompts(); renderRows(); });
+    const newBtn = $('#newBtn');
+    if (newBtn) newBtn.addEventListener('click', () => { openDrawer(editorHtml(null)); bindEditor(null); });
+    const reloadReleases = $('#reloadReleases');
+    if (reloadReleases) reloadReleases.addEventListener('click', async () => { await refreshPrompts(); render(); });
+
+    // 变更记录
+    const reloadChanges = $('#reloadChanges');
+    if (reloadChanges) reloadChanges.addEventListener('click', loadChanges);
+
+    // 运行日志
+    const logDays = $('#logDays');
+    if (logDays) logDays.addEventListener('change', () => { state.logDays = Number(logDays.value); loadLogs(); });
+    const reloadLogs = $('#reloadLogs');
+    if (reloadLogs) reloadLogs.addEventListener('click', loadLogs);
+    const pruneLogs = $('#pruneLogs');
+    if (pruneLogs) pruneLogs.addEventListener('click', async () => {
+      try { const r = await api('/api/logs/prune', { method: 'POST' }); toast(`已清理，保留 ${r.kept} 条`); loadLogs(); }
+      catch (error) { toast(error.message, true); }
+    });
+    $$('[data-logfilter]').forEach(btn => btn.addEventListener('click', () => {
+      state.logFilter.ok = btn.dataset.logfilter;
+      loadLogs();
+    }));
+
+    // 项目设置
+    const saveSettings = $('#saveSettings');
+    if (saveSettings) saveSettings.addEventListener('click', async () => {
+      const payload = { actor: '管理员' };
+      ['model', 'temperature', 'maxTokens', 'timeoutMs', 'retries', 'promptMaxChars', 'promptMaxCount', 'inputPricePerM', 'outputPricePerM', 'logRetentionDays'].forEach(key => {
+        payload[key] = $('#s-' + key).value;
+      });
+      payload.analyzeEnabled = $('#s-analyzeEnabled').value === 'true';
+      try {
+        const data = await api('/api/settings', { method: 'PUT', body: payload });
+        state.settings = data.settings;
+        toast('设置已保存，立即生效');
+        await refreshPrompts();
+        render();
+      } catch (error) { toast(error.message, true); }
+    });
+    const reloadSettings = $('#reloadSettings');
+    if (reloadSettings) reloadSettings.addEventListener('click', loadSettings);
+  }
+
+  // 表格与时间线里的委托事件
+  document.addEventListener('click', async event => {
+    const target = event.target.closest('[data-act]');
+    if (!target) return;
+    const act = target.dataset.act;
+
+    if (act === 'close-drawer') { closeDrawer(); return; }
+
+    if (act === 'edit' || act === 'history') {
+      event.preventDefault();
+      const id = target.dataset.id;
+      if (act === 'history') return void openHistory(id);
+      try {
+        const data = await api(`/api/prompts/${id}`);
+        openDrawer(editorHtml(data.prompt));
+        bindEditor(data.prompt);
+      } catch (error) { toast(error.message, true); }
+      return;
+    }
+
+    if (act === 'open-versions') {
+      event.preventDefault();
+      return void openHistory(target.dataset.id);
+    }
+
+    if (act === 'toggle') {
+      try {
+        await api(`/api/prompts/${target.dataset.id}/toggle`, {
+          method: 'POST',
+          body: { enabled: target.dataset.enabled === 'true', actor: '管理员' }
+        });
+        await refreshPrompts();
+        renderRows();
+        toast(target.dataset.enabled === 'true' ? '启用状态已保存为草稿，发布后生效' : '停用状态已保存为草稿，发布后生效');
+      } catch (error) { toast(error.message, true); }
+      return;
+    }
+
+    if (act === 'submit-review' || act === 'reject-review' || act === 'publish') {
+      const labels = { 'submit-review': '提交审核', 'reject-review': '驳回为草稿', publish: '发布到生产' };
+      if (!window.confirm(`确认${labels[act]}？`)) return;
+      try {
+        const data = await api(`/api/prompts/${target.dataset.id}/${act}`, {
+          method: 'POST', body: { actor: '管理员', note: labels[act] }
+        });
+        await refreshPrompts();
+        render();
+        const message = act === 'publish'
+          ? `已发布生产版本 ${data.prompt.publishedVersion}`
+          : act === 'submit-review' ? '已提交审核，生产版本未变化' : '已驳回为草稿';
+        toast(message);
+      } catch (error) { toast(error.message, true); }
+    }
+  });
+
+  $('#drawer').addEventListener('click', event => { if (event.target.id === 'drawer') closeDrawer(); });
+  document.addEventListener('keydown', event => { if (event.key === 'Escape') closeDrawer(); });
+
+  $$('#nav button').forEach(btn => btn.addEventListener('click', () => navigate(btn.dataset.route)));
+
+  /* ---------- 启动 ---------- */
+
+  (async function start() {
+    setNav(state.route);
+    try {
+      await refreshPrompts();
+      render();
+      renderRows();
+
+      const overview = state.overview;
+      if (overview) {
+        const changesBtn = $('#nav button[data-route="changes"]');
+        if (changesBtn) changesBtn.innerHTML = `<i>◷</i><span>变更记录</span><span class="badge">${overview.changes7d}</span>`;
+      }
+    } catch (error) {
+      showConnError(`无法连接到管理接口：${error.message}。请通过 node server.js 启动后访问 /admin。`);
+      $('#page').innerHTML = loading('数据加载失败');
+    }
+  })();
+})();

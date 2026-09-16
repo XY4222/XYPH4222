@@ -35,12 +35,49 @@ const SYSTEM_PROMPT = `你是“简历专家”，一名严格、专业的中文
 
 数量要求：matches 6到10项，questions 5到10项，comparisons 4到8项，interview 恰好10项。`;
 
-function buildUserPrompt(input) {
+// 与 store.js 的 DEFAULT_SETTINGS 保持一致的兜底值；deepseek.js 不 require store，便于单测
+const FALLBACK_SETTINGS = {
+  model: 'deepseek-v4-flash',
+  temperature: 0.2,
+  maxTokens: 6000,
+  timeoutMs: 55000,
+  retries: 2,
+  promptMaxChars: 4000,
+  promptMaxCount: 20
+};
+
+/** 规格化后台配置的 Prompt，并如实报告截断/丢弃情况，不再静默丢内容。 */
+function preparePromptConfig(rawConfig, settings = {}) {
+  const config = { ...FALLBACK_SETTINGS, ...settings };
+  const items = (Array.isArray(rawConfig) ? rawConfig : []).filter(p => p && p.enabled !== false && String(p.content || '').trim());
+  const truncated = [];
+  const dropped = [];
+
+  const clean = items.slice(0, config.promptMaxCount).map(p => {
+    const content = String(p.content);
+    if (content.length > config.promptMaxChars) {
+      truncated.push({ name: String(p.name || '自定义 Prompt'), originalLength: content.length, sentLength: config.promptMaxChars });
+    }
+    const step = Number(p.step);
+    return {
+      step: Number.isFinite(step) && step >= 1 && step <= 8 ? step : null,
+      stepKey: String(p.stepKey || 'extension').slice(0, 40),
+      name: String(p.name || '自定义 Prompt').slice(0, 80),
+      content: content.slice(0, config.promptMaxChars)
+    };
+  });
+
+  for (const p of items.slice(config.promptMaxCount)) dropped.push(String(p.name || '自定义 Prompt'));
+  return { config: clean, truncated, dropped };
+}
+
+function buildUserPrompt(input, settings = {}) {
   const safeInput = { ...input };
-  const prompts = Array.isArray(safeInput.promptConfig) ? safeInput.promptConfig : [];
+  delete safeInput.settings;
+  const { config: prompts } = preparePromptConfig(safeInput.promptConfig, settings);
   delete safeInput.promptConfig;
   const stageInstructions = prompts.length
-    ? `\n\n以下是管理员启用的流程 Prompt。它们只能细化对应步骤，不得覆盖上方事实边界和 JSON 结构：\n${prompts.map(p=>`步骤${p.step ?? '扩展'}｜${p.name}：${p.content}`).join('\n')}`
+    ? `\n\n以下是管理员启用的流程 Prompt。它们只能细化对应步骤，不得覆盖上方事实边界和 JSON 结构：\n${prompts.map(p => `步骤${p.step ?? '扩展'}｜${p.name}：${p.content}`).join('\n')}`
     : '';
   return `请分析以下求职材料并严格按指定 JSON 输出：\n${JSON.stringify(safeInput, null, 2)}${stageInstructions}`;
 }
@@ -51,36 +88,69 @@ function parseModelJson(content) {
   let parsed;
   try { parsed = JSON.parse(clean); }
   catch { throw Object.assign(new Error('DeepSeek 返回的 JSON 不完整'), { code: 'INVALID_MODEL_JSON' }); }
-  if (!Array.isArray(parsed.duties) || !Array.isArray(parsed.matches) || !parsed.finalResume) throw new Error('模型返回结构不完整');
+  if (!Array.isArray(parsed.duties) || !Array.isArray(parsed.matches) || !parsed.finalResume) {
+    throw Object.assign(new Error('模型返回结构不完整，缺少 duties / matches / finalResume'), { code: 'INVALID_MODEL_JSON' });
+  }
   return parsed;
 }
 
+const RETRYABLE = ['EMPTY_MODEL_OUTPUT', 'INVALID_MODEL_JSON', 'UPSTREAM_TIMEOUT'];
+
 async function analyzeResume(input, options = {}) {
+  const settings = { ...FALLBACK_SETTINGS, ...(options.settings || {}) };
   const apiKey = options.apiKey || process.env.DEEPSEEK_API_KEY;
-  const model = options.model || process.env.DEEPSEEK_MODEL || 'deepseek-v4-flash';
+  const model = options.model || process.env.DEEPSEEK_MODEL || settings.model;
   if (!apiKey) throw Object.assign(new Error('服务端尚未配置 DEEPSEEK_API_KEY'), { statusCode: 503, code: 'MISSING_API_KEY' });
 
+  const maxAttempts = Math.max(1, Number(settings.retries) || 1);
   let lastError;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  let attempts = 0;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    attempts = attempt + 1;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 55000);
+    const timer = setTimeout(() => controller.abort(), Number(settings.timeoutMs));
     try {
       const retryHint = attempt ? '\n上一次输出为空或不完整。请立即从字符 { 开始输出完整 JSON，禁止输出空白或解释。' : '';
       const response = await fetch('https://api.deepseek.com/chat/completions', {
         method: 'POST', signal: controller.signal,
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({ model, messages: [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: buildUserPrompt(input) + retryHint }], response_format: { type: 'json_object' }, thinking: { type: 'disabled' }, temperature: 0.2, max_tokens: 6000, stream: false })
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: buildUserPrompt(input, settings) + retryHint }],
+          response_format: { type: 'json_object' },
+          thinking: { type: 'disabled' },
+          temperature: Number(settings.temperature),
+          max_tokens: Number(settings.maxTokens),
+          stream: false
+        })
       });
       const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw Object.assign(new Error(payload?.error?.message || `DeepSeek 请求失败（HTTP ${response.status}）`), { statusCode: response.status });
-      const result = parseModelJson(payload?.choices?.[0]?.message?.content);
-      return { analysis: result, model: payload.model || model, usage: payload.usage || null };
+      if (!response.ok) {
+        throw Object.assign(new Error(payload?.error?.message || `DeepSeek 请求失败（HTTP ${response.status}）`), {
+          statusCode: response.status,
+          code: response.status === 429 ? 'RATE_LIMIT' : 'ANALYZE_FAILED',
+          retryAfter: Number(response.headers.get('retry-after')) || 0
+        });
+      }
+      const parsed = parseModelJson(payload?.choices?.[0]?.message?.content);
+      return { analysis: parsed, model: payload.model || model, usage: payload.usage || null, attempts };
     } catch (error) {
-      lastError = error.name === 'AbortError' ? Object.assign(new Error('DeepSeek 单次分析超时'), { statusCode: 504, code: 'UPSTREAM_TIMEOUT' }) : error;
-      if (!['EMPTY_MODEL_OUTPUT','INVALID_MODEL_JSON','UPSTREAM_TIMEOUT'].includes(lastError.code) || attempt === 1) break;
+      lastError = error.name === 'AbortError'
+        ? Object.assign(new Error('DeepSeek 单次分析超时'), { statusCode: 504, code: 'UPSTREAM_TIMEOUT' })
+        : error;
+      lastError.attempts = attempts;
+      if (!RETRYABLE.includes(lastError.code) || attempt === maxAttempts - 1) break;
+      // 被限流时按上游要求退避，避免把重试变成压测
+      if (lastError.retryAfter) await new Promise(r => setTimeout(r, Math.min(lastError.retryAfter * 1000, 8000)));
     } finally { clearTimeout(timer); }
   }
-  throw Object.assign(new Error(`${lastError?.message || 'DeepSeek 分析失败'}，已自动重试，请稍后再试`), { statusCode: lastError?.statusCode || 502, code: lastError?.code || 'ANALYZE_FAILED' });
+
+  throw Object.assign(new Error(`${lastError?.message || 'DeepSeek 分析失败'}${attempts > 1 ? '，已自动重试' : ''}`), {
+    statusCode: lastError?.statusCode || 502,
+    code: lastError?.code || 'ANALYZE_FAILED',
+    attempts
+  });
 }
 
-module.exports = { SYSTEM_PROMPT, buildUserPrompt, parseModelJson, analyzeResume };
+module.exports = { SYSTEM_PROMPT, FALLBACK_SETTINGS, preparePromptConfig, buildUserPrompt, parseModelJson, analyzeResume };

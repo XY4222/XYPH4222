@@ -200,11 +200,30 @@ function collectForm(){
   state.form.highlights=$$('input[name=highlight]:checked').map(x=>x.value);
 }
 
+/* Prompt 配置以服务端为准（管理后台维护，data/prompts.json）。
+ * 启动时拉一次缓存；若接口不可用（例如纯静态部署），退回旧的 localStorage 方案，
+ * 保证前端在任何部署形态下都能工作。 */
+let serverPromptConfig = null;
+
+async function loadPromptConfig(){
+  try {
+    const response=await fetch('/api/prompts/active');
+    if(!response.ok) return;
+    const data=await response.json();
+    if(Array.isArray(data.prompts)){
+      serverPromptConfig=data.prompts;
+      if(data.truncated?.length) console.warn('[prompts] 以下 Prompt 超出长度上限，已截断：',data.truncated);
+      if(data.dropped?.length) console.warn('[prompts] 以下 Prompt 超出条数上限，未注入：',data.dropped);
+    }
+  } catch { /* 静默退回本地配置 */ }
+}
+
 function getActivePromptConfig(){
+  if(Array.isArray(serverPromptConfig)&&serverPromptConfig.length) return serverPromptConfig;
   try {
     const items=JSON.parse(localStorage.getItem('resume-expert-prompts-v2')||'[]');
     if(!Array.isArray(items)) return [];
-    return items.filter(p=>p&&p.enabled&&p.content).slice(0,20).map(p=>({step:Number.isFinite(Number(p.step))?Number(p.step):null,stepKey:String(p.stepKey||'extension').slice(0,40),name:String(p.name||'自定义 Prompt').slice(0,80),content:String(p.content).slice(0,4000)}));
+    return items.filter(p=>p&&p.enabled&&p.content).slice(0,20).map(p=>({step:Number.isFinite(Number(p.step))?Number(p.step):null,stepKey:String(p.stepKey||'extension').slice(0,40),name:String(p.name||'自定义 Prompt').slice(0,80),content:String(p.content)}));
   } catch { return []; }
 }
 
@@ -253,3 +272,4 @@ function showResetDialog(){ const d=$('#dialog'); d.innerHTML=`<div class="dialo
 function showErrorDialog(message){ const d=$('#dialog'); d.innerHTML=`<div class="dialog"><h3>DeepSeek 分析未完成</h3><p>${escapeHtml(message)}</p><div class="dialog-actions"><button class="button primary" data-action="close-dialog">返回修改</button></div></div>`; d.classList.add('open'); d.setAttribute('aria-hidden','false'); }
 
 render();
+loadPromptConfig();
