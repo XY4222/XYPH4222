@@ -25,6 +25,7 @@
     regressionRuns: [],
     feedback: [],
     feedbackStats: null,
+    rules: [],
     testResult: null,
     testForm: { promptId: '', caseId: '', name: '', role: '', jd: '', resume: '', extra: '', minScore: '0', maxScoreDrop: '5', requiredTerms: '' },
     currentPrompt: null,
@@ -213,7 +214,7 @@
 
   /* ---------- 路由 ---------- */
 
-  const ROUTE_TITLE = { prompts: 'Prompt 总览', releases: '发布中心', tests: 'Prompt 测试台', changes: '变更记录', logs: '运行日志', feedback: '质量反馈', settings: '项目设置' };
+  const ROUTE_TITLE = { prompts: 'Prompt 总览', releases: '发布中心', tests: 'Prompt 测试台', changes: '变更记录', logs: '运行日志', feedback: '质量反馈', rules: '风险规则', settings: '项目设置' };
 
   function setNav(route) {
     $('#crumb').textContent = ROUTE_TITLE[route] || route;
@@ -229,6 +230,7 @@
       if (route === 'changes') await loadChanges();
       else if (route === 'logs') await loadLogs();
       else if (route === 'feedback') await loadFeedback();
+      else if (route === 'rules') await loadRules();
       else if (route === 'settings') await loadSettings();
       else if (route === 'tests') await loadTests();
       else if ((route === 'prompts' || route === 'releases') && !state.overview) await loadPrompts();
@@ -243,6 +245,7 @@
     else if (state.route === 'changes') page.innerHTML = viewChanges();
     else if (state.route === 'logs') page.innerHTML = viewLogs();
     else if (state.route === 'feedback') page.innerHTML = viewFeedback();
+    else if (state.route === 'rules') page.innerHTML = viewRules();
     else page.innerHTML = viewSettings();
     bindView();
     // viewPrompts() 只铺出空表格骨架，行要靠 renderRows 填。切走再切回来时
@@ -260,6 +263,11 @@
       ${can('editor') ? `<section class="panel"><div class="panel-head"><div><h2>新增反馈</h2><p>从运行日志的 ID 关联请求；不要粘贴 JD 或简历原文</p></div></div><div style="padding:18px"><div class="grid2"><div class="field"><label>运行记录 ID</label><input id="feedback-logId" placeholder="例如：mabc123-x7k9" /></div><div class="field"><label>评价</label><select id="feedback-rating"><option value="bad">需改进</option><option value="good">有效</option></select></div><div class="field"><label>问题标签</label><input id="feedback-tags" placeholder="例如：事实错误、结构不完整、格式问题" /></div><div class="field"><label>负责人</label><input id="feedback-owner" /></div></div><div class="field"><label>备注</label><textarea id="feedback-comment" style="min-height:90px" placeholder="记录可复现的问题和改进方向"></textarea></div><div style="display:flex;justify-content:flex-end"><button class="primary" id="saveFeedback">保存反馈</button></div></div></section>` : ''}
       <section class="stats"><div class="stat"><label>反馈总数</label><strong>${s.total}</strong><small>有效 ${s.good} · 需改进 ${s.bad}</small></div><div class="stat"><label>正向率</label><strong>${s.positiveRate}%</strong><small>基于人工反馈</small></div><div class="stat"><label>待处理</label><strong>${s.open}</strong><small>开放或审查中</small></div><div class="stat"><label>已解决</label><strong>${s.resolved}</strong><small>已闭环反馈</small></div></section>
       <section class="panel"><div class="panel-head"><div><h2>反馈明细</h2><p>通过运行记录 ID 关联具体请求</p></div></div>${rows ? `<table class="table"><thead><tr><th>更新时间</th><th>评价</th><th>状态</th><th>岗位</th><th>Prompt</th><th>问题标签</th><th>备注</th><th>处理状态</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">暂无质量反馈</div>'}</section>`;
+  }
+
+  function viewRules() {
+    const rows = state.rules.map(rule => `<tr><td>${escapeHtml(rule.name)}</td><td>${tag(rule.type === 'forbidden_pattern' ? '禁止匹配' : '必须匹配', rule.type === 'forbidden_pattern' ? 'red' : 'blue')}</td><td><code>${escapeHtml(rule.pattern)}</code></td><td>${tag(rule.severity, rule.severity === 'critical' || rule.severity === 'high' ? 'red' : 'amber')}</td><td>${rule.enabled ? tag('启用', 'green') : tag('停用')}</td><td>${can('editor') ? `<button class="iconbtn" data-rule-toggle="${escapeHtml(rule.id)}" data-enabled="${rule.enabled ? 'false' : 'true'}">${rule.enabled ? '停用' : '启用'}</button>` : ''}${can('admin') ? `<button class="iconbtn danger-text" data-rule-delete="${escapeHtml(rule.id)}">删除</button>` : ''}</td></tr>`).join('');
+    return `<div class="headline"><div><h1>风险规则</h1><p>服务端扫描模型输出，命中结果会回传给调用方并写入运行指标。</p></div><button class="secondary" id="reloadRules">刷新</button></div><section class="panel"><div class="panel-head"><div><h2>规则列表</h2><p>规则变更进入审计记录；停用不删除历史</p></div></div>${rows ? `<table class="table"><thead><tr><th>规则</th><th>类型</th><th>模式</th><th>级别</th><th>状态</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">暂无风险规则</div>'}</section>`;
   }
 
   function captureTestForm() {
@@ -899,6 +907,11 @@
     } catch (error) { showConnError(`质量反馈加载失败：${error.message}`); }
   }
 
+  async function loadRules() {
+    try { const data = await api('/api/rules'); state.rules = data.items || []; clearConnError(); render(); }
+    catch (error) { showConnError(`风险规则加载失败：${error.message}`); }
+  }
+
   async function loadSettings() {
     try {
       const data = await api('/api/settings');
@@ -1084,6 +1097,17 @@
     });
     $$('[data-feedback-status]').forEach(select => select.addEventListener('change', async () => {
       try { await api(`/api/feedback/${encodeURIComponent(select.dataset.feedbackStatus)}`, { method: 'PUT', body: { status: select.value } }); toast('反馈状态已更新'); await loadFeedback(); }
+      catch (error) { toast(error.message, true); }
+    }));
+    const reloadRules = $('#reloadRules');
+    if (reloadRules) reloadRules.addEventListener('click', loadRules);
+    $$('[data-rule-toggle]').forEach(button => button.addEventListener('click', async () => {
+      try { await api(`/api/rules/${encodeURIComponent(button.dataset.ruleToggle)}`, { method: 'PUT', body: { enabled: button.dataset.enabled === 'true' } }); toast('规则状态已更新'); await loadRules(); }
+      catch (error) { toast(error.message, true); }
+    }));
+    $$('[data-rule-delete]').forEach(button => button.addEventListener('click', async () => {
+      if (!window.confirm('确认删除这条风险规则？历史命中记录不会被删除。')) return;
+      try { await api(`/api/rules/${encodeURIComponent(button.dataset.ruleDelete)}`, { method: 'DELETE' }); toast('风险规则已删除'); await loadRules(); }
       catch (error) { toast(error.message, true); }
     }));
 

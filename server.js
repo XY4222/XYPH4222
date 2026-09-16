@@ -62,6 +62,7 @@ function record(entry) {
     modelReturned: entry.modelReturned || null,
     role: entry.role || null,
     prompts: entry.prompts || [],
+    riskHits: entry.riskHits || [],
     truncated: entry.truncated || [],
     dropped: entry.dropped || [],
     inputChars: entry.inputChars || 0
@@ -89,15 +90,17 @@ async function handleAnalyze(req, res) {
     const payload = { ...input, promptConfig: resolved.config };
 
     const result = await analyzeResume(payload, { settings });
+    const riskCheck = store.scanRisk(result.analysis?.finalResume);
     const runId = record({
       ok: true, modelReturned: result.model, usage: result.usage, latencyMs: Date.now() - started,
       attempts: result.attempts, role: input.role, prompts: resolved.config.map(p => p.name),
       truncated: resolved.truncated, dropped: resolved.dropped,
+      riskHits: riskCheck.violations.map(item => item.ruleId),
       inputChars: String(input.jd || '').length + String(input.resume || '').length
     });
     return send(res, 200, {
       ...result,
-      promptConfig: { applied: resolved.config.length, truncated: resolved.truncated, dropped: resolved.dropped }, runId
+      promptConfig: { applied: resolved.config.length, truncated: resolved.truncated, dropped: resolved.dropped }, riskCheck, runId
     });
   } catch (error) {
     const runId = record({
@@ -397,6 +400,11 @@ const routes = {
     stats: store.feedbackStats()
   }),
 
+  'GET /api/rules': (req, res) => send(res, 200, { items: store.listRules() }),
+  'POST /api/rules': async (req, res) => { const body = await readBody(req, ADMIN_LIMIT); send(res, 201, { item: store.createRule(body, req.auth.username) }); },
+  'PUT /api/rules/:id': async (req, res, url, params) => { const body = await readBody(req, ADMIN_LIMIT); const item = store.updateRule(params.id, body, req.auth.username); if (!item) return send(res, 404, { error: '风险规则不存在', code: 'NOT_FOUND' }); send(res, 200, { item }); },
+  'DELETE /api/rules/:id': (req, res, url, params) => { if (!store.removeRule(params.id, req.auth.username)) return send(res, 404, { error: '风险规则不存在', code: 'NOT_FOUND' }); send(res, 200, { ok: true }); },
+
   'POST /api/feedback': async (req, res) => {
     const body = await readBody(req, ADMIN_LIMIT);
     send(res, 201, { item: store.saveFeedback(body, req.auth.username) });
@@ -434,6 +442,8 @@ function requiredRole(method, pathname) {
   if (method === 'POST' && /^\/api\/prompts\/[^/]+\/regression$/.test(pathname)) return 'editor';
   if (method === 'POST' && pathname === '/api/test-cases') return 'editor';
   if ((method === 'POST' && pathname === '/api/feedback') || (method === 'PUT' && /^\/api\/feedback\/[^/]+$/.test(pathname))) return 'editor';
+  if (method === 'POST' && pathname === '/api/rules') return 'editor';
+  if (method === 'PUT' && /^\/api\/rules\/[^/]+$/.test(pathname)) return 'editor';
   return 'admin';
 }
 

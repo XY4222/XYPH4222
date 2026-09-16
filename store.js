@@ -12,6 +12,7 @@ const path = require('path');
  * data/prompt-tests.jsonl —— Prompt 测试运行指标，不保存简历原文
  * data/regressions.jsonl —— 回归门禁运行结果，不保存测试输入原文
  * data/feedback.json —— 调用质量反馈，只保存评价元数据
+ * data/rules.json —— 输出风险规则与启停状态
  *
  * 原则：版本快照只追加、不覆盖。回滚是「以旧内容生成一个新版本」，不是删除历史。
  */
@@ -25,7 +26,8 @@ const FILES = {
   testCases: path.join(DATA_DIR, 'test-cases.json'),
   promptTests: path.join(DATA_DIR, 'prompt-tests.jsonl'),
   regressions: path.join(DATA_DIR, 'regressions.jsonl'),
-  feedback: path.join(DATA_DIR, 'feedback.json')
+  feedback: path.join(DATA_DIR, 'feedback.json'),
+  rules: path.join(DATA_DIR, 'rules.json')
 };
 
 const LOG_LIMIT = 5000;
@@ -81,6 +83,10 @@ function ensureData() {
   if (!fs.existsSync(FILES.promptTests)) fs.writeFileSync(FILES.promptTests, '', 'utf8');
   if (!fs.existsSync(FILES.regressions)) fs.writeFileSync(FILES.regressions, '', 'utf8');
   if (!fs.existsSync(FILES.feedback)) writeJson(FILES.feedback, []);
+  if (!fs.existsSync(FILES.rules)) writeJson(FILES.rules, [
+    { id: 'rule-no-fabrication-terms', name: '禁止虚构承诺', type: 'forbidden_pattern', pattern: '虚构|编造|捏造', severity: 'high', enabled: true, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+    { id: 'rule-review-placeholders', name: '检查未确认占位符', type: 'forbidden_pattern', pattern: '【待补充|【待确认', severity: 'medium', enabled: true, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
+  ]);
 
   // 兼容旧数据：升级前的每条记录都等同于已经在线生效的生产版本。
   const existing = readJson(FILES.prompts, []);
@@ -692,6 +698,63 @@ function feedbackStats() {
   return { total: items.length, good, bad, positiveRate: items.length ? Number((good / items.length * 100).toFixed(1)) : 0, open: items.filter(item => ['open', 'reviewing'].includes(item.status)).length, resolved: items.filter(item => item.status === 'resolved').length, byTag: Object.entries(byTag).map(([tag, count]) => ({ tag, count })).sort((a, b) => b.count - a.count) };
 }
 
+/* ---------- 风险与规则 ---------- */
+
+const RULE_SEVERITIES = new Set(['low', 'medium', 'high', 'critical']);
+const RULE_TYPES = new Set(['forbidden_pattern', 'required_pattern']);
+
+function listRules() { return readJson(FILES.rules, []).sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt)); }
+
+function createRule(input, actor) {
+  const name = clip(input.name, 100).trim();
+  const pattern = clip(input.pattern, 300).trim();
+  const type = RULE_TYPES.has(input.type) ? input.type : 'forbidden_pattern';
+  const severity = RULE_SEVERITIES.has(input.severity) ? input.severity : 'medium';
+  if (!name || !pattern) throw Object.assign(new Error('规则名称和匹配模式不能为空'), { statusCode: 400, code: 'INVALID_RULE' });
+  try { new RegExp(pattern, 'iu'); } catch { throw Object.assign(new Error('规则匹配模式不是合法正则表达式'), { statusCode: 400, code: 'INVALID_RULE_PATTERN' }); }
+  const now = new Date().toISOString();
+  const rule = { id: `rule-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`, name, type, pattern, severity, enabled: input.enabled !== false, createdAt: now, updatedAt: now, updatedBy: actor };
+  const rules = readJson(FILES.rules, []); rules.push(rule); writeJson(FILES.rules, rules);
+  pushAuditEvent('rule_create', actor, `风险规则：${name}`, `创建 ${rule.id}`);
+  return rule;
+}
+
+function updateRule(id, input, actor) {
+  const rules = readJson(FILES.rules, []); const rule = rules.find(item => item.id === id);
+  if (!rule) return null;
+  if (input.name !== undefined) rule.name = clip(input.name, 100).trim();
+  if (input.pattern !== undefined) { const pattern = clip(input.pattern, 300).trim(); try { new RegExp(pattern, 'iu'); } catch { throw Object.assign(new Error('规则匹配模式不是合法正则表达式'), { statusCode: 400, code: 'INVALID_RULE_PATTERN' }); } rule.pattern = pattern; }
+  if (input.type !== undefined && !RULE_TYPES.has(input.type)) throw Object.assign(new Error('规则类型无效'), { statusCode: 400, code: 'INVALID_RULE_TYPE' });
+  if (input.severity !== undefined && !RULE_SEVERITIES.has(input.severity)) throw Object.assign(new Error('规则严重级别无效'), { statusCode: 400, code: 'INVALID_RULE_SEVERITY' });
+  if (input.type !== undefined) rule.type = input.type;
+  if (input.severity !== undefined) rule.severity = input.severity;
+  if (input.enabled !== undefined) rule.enabled = input.enabled === true;
+  rule.updatedAt = new Date().toISOString(); rule.updatedBy = actor; writeJson(FILES.rules, rules);
+  pushAuditEvent('rule_update', actor, `风险规则：${rule.name}`, `更新 ${rule.id}`);
+  return rule;
+}
+
+function removeRule(id, actor) {
+  const rules = readJson(FILES.rules, []); const rule = rules.find(item => item.id === id);
+  if (!rule) return false;
+  writeJson(FILES.rules, rules.filter(item => item.id !== id));
+  pushAuditEvent('rule_delete', actor, `风险规则：${rule.name}`, `删除 ${rule.id}`);
+  return true;
+}
+
+function scanRisk(text) {
+  const source = String(text || '');
+  const violations = [];
+  for (const rule of listRules().filter(item => item.enabled)) {
+    let matched = false;
+    try { matched = new RegExp(rule.pattern, 'iu').test(source); } catch { continue; }
+    if ((rule.type === 'forbidden_pattern' && matched) || (rule.type === 'required_pattern' && !matched)) {
+      violations.push({ ruleId: rule.id, ruleName: rule.name, severity: rule.severity, type: rule.type });
+    }
+  }
+  return { passed: violations.length === 0, violations };
+}
+
 /* ---------- Prompt 测试台 ---------- */
 
 function listTestCases(promptId) {
@@ -899,5 +962,6 @@ module.exports = {
   listTestCases, createTestCase, removeTestCase, appendPromptTest, listPromptTests, buildPromptConfigForTest,
   regressionSuiteKey, appendRegression, listRegressions,
   findLog, listFeedback, saveFeedback, updateFeedback, feedbackStats,
+  listRules, createRule, updateRule, removeRule, scanRisk,
   overview, costOf, bumpVersion
 };
