@@ -31,6 +31,11 @@ try {
   check('失败调用也关联实际 Prompt 版本', stats.byPromptVersion.some(item => item.prompt === '简历诊断' && item.version === 'v1.0' && item.failed === 1 && item.schemaErrors === 1));
   check('异常阈值告警按区间统计触发', stats.alerts.some(item => item.scope === 'overall' && item.metric === 'failureRate') && stats.alerts.some(item => item.scope === '简历诊断@v1.0' && item.metric === 'schemaErrorRate'));
   check('Schema 告警按请求计数而非字段计数', stats.alerts.find(item => item.scope === 'overall' && item.metric === 'schemaErrorRate')?.rate === 25);
+  const alert = stats.alerts.find(item => item.scope === 'overall' && item.metric === 'failureRate');
+  const ack = store.acknowledgeAlert(alert.id, '监控管理员');
+  const acknowledged = store.logStats(7).alerts.find(item => item.id === alert.id);
+  check('告警确认状态持久化并回显', ack.id === alert.id && acknowledged?.acknowledged === true && acknowledged.acknowledgedBy === '监控管理员' && store.listAlertHistory()[0].id === alert.id);
+  try { store.acknowledgeAlert('bad id', '监控管理员'); check('非法告警 ID 被拒绝', false); } catch (error) { check('非法告警 ID 被拒绝', error.code === 'INVALID_ALERT_ID'); }
   const statWithFilter = store.logStats(7, { model: 'model-a', minLatency: 3000 });
   check('统计接口与明细接口使用同一筛选口径', statWithFilter.total === 1 && statWithFilter.byModel[0].model === 'model-a');
 } finally { try { fs.rmSync(staged, { recursive: true, force: true }); } catch {} }

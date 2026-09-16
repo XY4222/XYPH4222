@@ -30,7 +30,8 @@ const FILES = {
   feedback: path.join(DATA_DIR, 'feedback.json'),
   rules: path.join(DATA_DIR, 'rules.json'),
   templates: path.join(DATA_DIR, 'templates.json'),
-  templateVersions: path.join(DATA_DIR, 'template-versions.json')
+  templateVersions: path.join(DATA_DIR, 'template-versions.json'),
+  alertAcks: path.join(DATA_DIR, 'alert-ack.json')
 };
 
 const LOG_LIMIT = 5000;
@@ -100,6 +101,7 @@ function ensureData() {
     { id: 'tpl-jd-match', name: 'JD 证据映射', type: 'task', stepKey: 'match', step: 4, desc: '将岗位要求映射到候选人证据', content: '将 {{jd}} 的关键要求逐项映射到 {{resume}} 的证据，区分强、中、弱、无，并指出需要补充的事实。', variables: ['jd', 'resume'], version: 'v1.0', category: '匹配分析', tags: ['JD'], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
   ]);
   if (!fs.existsSync(FILES.templateVersions)) writeJson(FILES.templateVersions, []);
+  if (!fs.existsSync(FILES.alertAcks)) writeJson(FILES.alertAcks, []);
   const templates = readJson(FILES.templates, []);
   const templateVersions = readJson(FILES.templateVersions, []);
   let templatesChanged = false; let templateVersionsChanged = false;
@@ -543,7 +545,8 @@ const ACTION_LABEL = {
   submit_review: '提交审核', reject_review: '审核驳回', publish: '发布生产', production_rollback: '生产回滚',
   test_case_create: '保存测试案例', test_case_delete: '删除测试案例', feedback_update: '更新质量反馈',
   auth_login_failed: '登录失败', auth_login_success: '登录成功', auth_logout: '退出登录',
-  template_update: '编辑模板', template_archive: '归档模板', template_restore: '恢复模板', template_rollback: '回滚模板'
+  template_update: '编辑模板', template_archive: '归档模板', template_restore: '恢复模板', template_rollback: '回滚模板',
+  alert_ack: '确认告警'
 };
 
 function pushAuditEvent(action, actor, subject, note) {
@@ -695,6 +698,27 @@ function costOf(usage, settings) {
   return (input / 1e6) * settings.inputPricePerM + (output / 1e6) * settings.outputPricePerM;
 }
 
+function alertId(scope, metric, rate, threshold, calls) {
+  const raw = [scope, metric, Number(rate).toFixed(1), Number(threshold), calls].join('|');
+  return `alert-${Buffer.from(raw).toString('base64').replace(/[^a-zA-Z0-9]/g, '').slice(0, 180)}`;
+}
+
+function listAlertHistory(limit = 100) {
+  return readJson(FILES.alertAcks, []).sort((a, b) => new Date(b.acknowledgedAt) - new Date(a.acknowledgedAt)).slice(0, Math.min(Math.max(Number(limit) || 100, 1), 500));
+}
+
+function acknowledgeAlert(id, actor) {
+  const safeId = String(id || '').trim();
+  if (!/^alert-[A-Za-z0-9]{1,180}$/.test(safeId)) throw Object.assign(new Error('告警 ID 无效'), { statusCode: 400, code: 'INVALID_ALERT_ID' });
+  const all = readJson(FILES.alertAcks, []);
+  const now = new Date().toISOString();
+  let item = all.find(row => row.id === safeId);
+  if (!item) { item = { id: safeId, acknowledgedAt: now, acknowledgedBy: clip(actor || '管理员', 80) }; all.push(item); }
+  writeJson(FILES.alertAcks, all);
+  pushAuditEvent('alert_ack', actor, `运行告警：${safeId}`, '管理员确认告警');
+  return item;
+}
+
 function percentile(sorted, ratio) {
   if (!sorted.length) return 0;
   return sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * ratio) - 1))];
@@ -774,8 +798,14 @@ function logStats(days = 7, filters = {}) {
 
   const alertMinCalls = Number(settings.alertMinCalls || DEFAULT_SETTINGS.alertMinCalls);
   const alerts = [];
+  const ackMap = new Map(listAlertHistory(500).map(item => [item.id, item]));
   const addAlert = (scope, metric, rate, threshold, calls, message) => {
-    if (calls >= alertMinCalls && threshold > 0 && rate >= threshold) alerts.push({ scope, metric, rate, threshold, calls, message });
+    if (calls >= alertMinCalls && threshold > 0 && rate >= threshold) {
+      const roundedRate = Number(rate.toFixed(1));
+      const id = alertId(scope, metric, roundedRate, threshold, calls);
+      const ack = ackMap.get(id);
+      alerts.push({ id, scope, metric, rate: roundedRate, threshold, calls, message, acknowledged: !!ack, acknowledgedAt: ack?.acknowledgedAt || null, acknowledgedBy: ack?.acknowledgedBy || null });
+    }
   };
   addAlert('overall', 'failureRate', total ? failed / total * 100 : 0, Number(settings.alertFailureRate), total, `整体失败率 ${total ? (failed / total * 100).toFixed(1) : '0.0'}% 超过阈值`);
   const schemaErrorCount = rows.filter(r => (r.validationErrors || []).length > 0).length;
@@ -809,6 +839,7 @@ function logStats(days = 7, filters = {}) {
     slowest: rows.filter(r => r.ok).sort((a, b) => Number(b.latencyMs || 0) - Number(a.latencyMs || 0)).slice(0, 10).map(r => ({ id: r.id, at: r.at, latencyMs: r.latencyMs, model: r.modelReturned || r.model, role: r.role, prompts: r.prompts || [], inputChars: r.inputChars, attempts: r.attempts })),
     filters: { models, prompts },
     alerts: alerts.sort((a, b) => b.rate - a.rate),
+    alertHistory: listAlertHistory(100),
     settings: { inputPricePerM: settings.inputPricePerM, outputPricePerM: settings.outputPricePerM, alertFailureRate: settings.alertFailureRate, alertSchemaErrorRate: settings.alertSchemaErrorRate, alertRetryRate: settings.alertRetryRate, alertMinCalls: settings.alertMinCalls },
     days
   };
@@ -1175,5 +1206,5 @@ module.exports = {
   listTemplates, updateTemplate, archiveTemplate, listTemplateVersions, rollbackTemplate, createPromptFromTemplate, batchPromptAction,
   dependencyView,
   validatePromptContent, replacePromptVariables, PROMPT_VARIABLES,
-  overview, costOf, bumpVersion
+  overview, costOf, bumpVersion, listAlertHistory, acknowledgeAlert
 };

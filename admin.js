@@ -550,7 +550,8 @@
     const modelRows = s.byModel.length ? s.byModel.map(item => `<tr><td>${escapeHtml(item.model)}</td><td>${item.total}</td><td>${item.successRate}%</td><td>${fmtLatency(item.avgLatency)}</td><td>${fmtNumber(item.tokens)}</td><td>¥${fmtCost(item.cost)}</td></tr>`).join('') : '';
     const promptRows = s.byPrompt.length ? s.byPrompt.map(item => `<tr><td>${escapeHtml(item.prompt)}</td><td>${item.calls}</td><td>${item.failed}</td><td>${item.truncated}</td><td>${item.dropped}</td></tr>`).join('') : '';
     const promptVersionRows = (s.byPromptVersion || []).length ? s.byPromptVersion.map(item => `<tr><td>${escapeHtml(item.prompt)}</td><td>${escapeHtml(item.version)}</td><td>${item.calls}</td><td>${item.failureRate}%</td><td>${item.retryRate}%</td><td>${fmtLatency(item.avgLatency)}</td><td>¥${fmtCost(item.cost)}</td><td>${item.schemaErrors}</td></tr>`).join('') : '';
-    const alertRows = (s.alerts || []).map(item => `<div class="banner warn show"><strong>${escapeHtml(item.scope)}</strong> · ${escapeHtml(item.message)}（${item.calls} 次调用，阈值 ${item.threshold}%）</div>`).join('');
+    const alertRows = (s.alerts || []).map(item => `<div class="banner ${item.acknowledged ? 'good' : 'warn'} show"><strong>${escapeHtml(item.scope)}</strong> · ${escapeHtml(item.message)}（${item.calls} 次调用，阈值 ${item.threshold}%） ${item.acknowledged ? `已确认：${escapeHtml(item.acknowledgedBy || '管理员')} · ${fullTime(item.acknowledgedAt)}` : (can('editor') ? `<button class="secondary" style="margin-left:10px;padding:4px 8px" data-alert-ack="${escapeHtml(item.id)}">确认</button>` : '')}</div>`).join('');
+    const alertHistoryRows = (s.alertHistory || []).map(item => `<tr><td class="prompt-meta">${fullTime(item.acknowledgedAt)}</td><td><code>${escapeHtml(item.id)}</code></td><td>${escapeHtml(item.acknowledgedBy || '-')}</td></tr>`).join('');
     const slowRows = s.slowest.length ? s.slowest.map(item => `<tr><td>${fullTime(item.at)}</td><td>${fmtLatency(item.latencyMs)}</td><td>${escapeHtml(item.model || '-')}</td><td>${escapeHtml(item.role || '-')}</td><td>${escapeHtml((item.prompts || []).join('、') || '-')}</td><td>${fmtNumber(item.inputChars)}</td><td>${item.attempts || 1}</td></tr>`).join('') : '';
 
     const rows = state.logs.map(l => {
@@ -603,6 +604,7 @@
         <div class="stat"><label>Schema 结构错误</label><strong>${fmtNumber((s.schemaFields || []).reduce((sum, item) => sum + item.count, 0))}</strong><small>${(s.schemaFields || []).slice(0, 3).map(item => `${escapeHtml(item.field)} ${item.count} 次`).join(' · ') || '无结构错误'}</small></div>
       </section>
       ${alertRows || '<div class="banner good show">当前区间没有触发异常阈值告警</div>'}
+      ${alertHistoryRows ? `<section class="panel"><div class="panel-head"><div><h2>告警确认历史</h2><p>仅记录告警 ID、确认人和时间，不保存业务输入</p></div></div><table class="table"><thead><tr><th>确认时间</th><th>告警 ID</th><th>确认人</th></tr></thead><tbody>${alertHistoryRows}</tbody></table></section>` : ''}
       <div class="grid2">
         <section class="panel">
           <div class="panel-head"><div><h2>每日调用量</h2><p>失败调用叠加显示</p></div></div>
@@ -1188,6 +1190,13 @@
 
   // 表格与时间线里的委托事件
   document.addEventListener('click', async event => {
+    const alertButton = event.target.closest('[data-alert-ack]');
+    if (alertButton) {
+      alertButton.disabled = true;
+      try { await api(`/api/alerts/${encodeURIComponent(alertButton.dataset.alertAck)}/ack`, { method: 'POST', body: {} }); toast('告警已确认'); await loadLogs(); }
+      catch (error) { alertButton.disabled = false; toast(error.message, true); }
+      return;
+    }
     const templateButton = event.target.closest('[data-template-create]');
     if (templateButton) {
       try { const data = await api(`/api/templates/${encodeURIComponent(templateButton.dataset.templateCreate)}/create`, { method: 'POST', body: {} }); closeDrawer(); await refreshPrompts(); render(); toast(`已创建草稿：${data.prompt.name}`); } catch (error) { toast(error.message, true); }
