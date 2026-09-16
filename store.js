@@ -31,7 +31,8 @@ const FILES = {
   rules: path.join(DATA_DIR, 'rules.json'),
   templates: path.join(DATA_DIR, 'templates.json'),
   templateVersions: path.join(DATA_DIR, 'template-versions.json'),
-  alertAcks: path.join(DATA_DIR, 'alert-ack.json')
+  alertAcks: path.join(DATA_DIR, 'alert-ack.json'),
+  alertStates: path.join(DATA_DIR, 'alert-states.json')
 };
 
 const LOG_LIMIT = 5000;
@@ -102,6 +103,7 @@ function ensureData() {
   ]);
   if (!fs.existsSync(FILES.templateVersions)) writeJson(FILES.templateVersions, []);
   if (!fs.existsSync(FILES.alertAcks)) writeJson(FILES.alertAcks, []);
+  if (!fs.existsSync(FILES.alertStates)) writeJson(FILES.alertStates, []);
   const templates = readJson(FILES.templates, []);
   const templateVersions = readJson(FILES.templateVersions, []);
   let templatesChanged = false; let templateVersionsChanged = false;
@@ -698,25 +700,52 @@ function costOf(usage, settings) {
   return (input / 1e6) * settings.inputPricePerM + (output / 1e6) * settings.outputPricePerM;
 }
 
-function alertId(scope, metric, rate, threshold, calls) {
-  const raw = [scope, metric, Number(rate).toFixed(1), Number(threshold), calls].join('|');
+function alertId(scope, metric, threshold, context = 'default') {
+  const raw = [context, scope, metric, Number(threshold)].join('|');
   return `alert-${Buffer.from(raw).toString('base64').replace(/[^a-zA-Z0-9]/g, '').slice(0, 180)}`;
 }
 
+function readAlertStates() {
+  const states = readJson(FILES.alertStates, []);
+  const legacy = readJson(FILES.alertAcks, []);
+  for (const item of legacy) if (!states.some(row => row.id === item.id)) states.push({ ...item, status: 'acknowledged' });
+  return states;
+}
+
 function listAlertHistory(limit = 100) {
-  return readJson(FILES.alertAcks, []).sort((a, b) => new Date(b.acknowledgedAt) - new Date(a.acknowledgedAt)).slice(0, Math.min(Math.max(Number(limit) || 100, 1), 500));
+  return readAlertStates().sort((a, b) => new Date(b.lastSeenAt || b.acknowledgedAt || 0) - new Date(a.lastSeenAt || a.acknowledgedAt || 0)).slice(0, Math.min(Math.max(Number(limit) || 100, 1), 500));
 }
 
 function acknowledgeAlert(id, actor) {
   const safeId = String(id || '').trim();
   if (!/^alert-[A-Za-z0-9]{1,180}$/.test(safeId)) throw Object.assign(new Error('告警 ID 无效'), { statusCode: 400, code: 'INVALID_ALERT_ID' });
-  const all = readJson(FILES.alertAcks, []);
+  const all = readAlertStates();
+  const item = all.find(row => row.id === safeId);
+  if (!item) throw Object.assign(new Error('告警不存在或已过期'), { statusCode: 404, code: 'ALERT_NOT_FOUND' });
   const now = new Date().toISOString();
-  let item = all.find(row => row.id === safeId);
-  if (!item) { item = { id: safeId, acknowledgedAt: now, acknowledgedBy: clip(actor || '管理员', 80) }; all.push(item); }
-  writeJson(FILES.alertAcks, all);
+  item.acknowledgedAt = item.acknowledgedAt || now;
+  item.acknowledgedBy = item.acknowledgedBy || clip(actor || '管理员', 80);
+  item.status = item.status === 'recovered' ? 'recovered' : 'acknowledged';
+  writeJson(FILES.alertStates, all);
   pushAuditEvent('alert_ack', actor, `运行告警：${safeId}`, '管理员确认告警');
   return item;
+}
+
+function syncAlertStates(activeAlerts, context, eligible) {
+  const all = readAlertStates();
+  const now = new Date().toISOString();
+  const activeIds = new Set(activeAlerts.map(item => item.id));
+  for (const alert of activeAlerts) {
+    let state = all.find(item => item.id === alert.id);
+    if (!state) { state = { id: alert.id, scope: alert.scope, metric: alert.metric, threshold: alert.threshold, context, firstSeenAt: now, occurrences: 0 }; all.push(state); }
+    state.scope = alert.scope; state.metric = alert.metric; state.threshold = alert.threshold; state.context = context;
+    state.lastSeenAt = now; state.lastRate = alert.rate; state.lastCalls = alert.calls; state.occurrences = Number(state.occurrences || 0) + 1; state.status = state.acknowledgedAt ? 'acknowledged' : 'active';
+  }
+  if (eligible) for (const state of all) {
+    if (state.context === context && state.status !== 'recovered' && !activeIds.has(state.id)) { state.status = 'recovered'; state.recoveredAt = now; }
+  }
+  writeJson(FILES.alertStates, all);
+  return all;
 }
 
 function percentile(sorted, ratio) {
@@ -798,13 +827,14 @@ function logStats(days = 7, filters = {}) {
 
   const alertMinCalls = Number(settings.alertMinCalls || DEFAULT_SETTINGS.alertMinCalls);
   const alerts = [];
-  const ackMap = new Map(listAlertHistory(500).map(item => [item.id, item]));
+  const context = [days, filters.model || '', filters.prompt || '', filters.role || '', Number(filters.minLatency || 0)].join('|');
+  const ackMap = new Map(readAlertStates().map(item => [item.id, item]));
   const addAlert = (scope, metric, rate, threshold, calls, message) => {
     if (calls >= alertMinCalls && threshold > 0 && rate >= threshold) {
       const roundedRate = Number(rate.toFixed(1));
-      const id = alertId(scope, metric, roundedRate, threshold, calls);
+      const id = alertId(scope, metric, threshold, context);
       const ack = ackMap.get(id);
-      alerts.push({ id, scope, metric, rate: roundedRate, threshold, calls, message, acknowledged: !!ack, acknowledgedAt: ack?.acknowledgedAt || null, acknowledgedBy: ack?.acknowledgedBy || null });
+      alerts.push({ id, scope, metric, rate: roundedRate, threshold, calls, message, acknowledged: !!ack?.acknowledgedAt, acknowledgedAt: ack?.acknowledgedAt || null, acknowledgedBy: ack?.acknowledgedBy || null });
     }
   };
   addAlert('overall', 'failureRate', total ? failed / total * 100 : 0, Number(settings.alertFailureRate), total, `整体失败率 ${total ? (failed / total * 100).toFixed(1) : '0.0'}% 超过阈值`);
@@ -821,6 +851,7 @@ function logStats(days = 7, filters = {}) {
     addAlert(label, 'schemaErrorRate', schemaRate, Number(settings.alertSchemaErrorRate), item.calls, `${label} Schema 错误率 ${schemaRate.toFixed(1)}% 超过阈值`);
     addAlert(label, 'retryRate', retryRate, Number(settings.alertRetryRate), item.calls, `${label} 重试率 ${retryRate.toFixed(1)}% 超过阈值`);
   }
+  const alertHistory = syncAlertStates(alerts, context, total >= alertMinCalls);
   return {
     total, failed, successRate: total ? Number(((total - failed) / total * 100).toFixed(1)) : 100,
     avgLatency: latencies.length ? Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length) : 0,
@@ -839,7 +870,7 @@ function logStats(days = 7, filters = {}) {
     slowest: rows.filter(r => r.ok).sort((a, b) => Number(b.latencyMs || 0) - Number(a.latencyMs || 0)).slice(0, 10).map(r => ({ id: r.id, at: r.at, latencyMs: r.latencyMs, model: r.modelReturned || r.model, role: r.role, prompts: r.prompts || [], inputChars: r.inputChars, attempts: r.attempts })),
     filters: { models, prompts },
     alerts: alerts.sort((a, b) => b.rate - a.rate),
-    alertHistory: listAlertHistory(100),
+    alertHistory: alertHistory.slice().sort((a, b) => new Date(b.lastSeenAt || b.acknowledgedAt || 0) - new Date(a.lastSeenAt || a.acknowledgedAt || 0)).slice(0, 100),
     settings: { inputPricePerM: settings.inputPricePerM, outputPricePerM: settings.outputPricePerM, alertFailureRate: settings.alertFailureRate, alertSchemaErrorRate: settings.alertSchemaErrorRate, alertRetryRate: settings.alertRetryRate, alertMinCalls: settings.alertMinCalls },
     days
   };

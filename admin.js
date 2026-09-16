@@ -551,7 +551,7 @@
     const promptRows = s.byPrompt.length ? s.byPrompt.map(item => `<tr><td>${escapeHtml(item.prompt)}</td><td>${item.calls}</td><td>${item.failed}</td><td>${item.truncated}</td><td>${item.dropped}</td></tr>`).join('') : '';
     const promptVersionRows = (s.byPromptVersion || []).length ? s.byPromptVersion.map(item => `<tr><td>${escapeHtml(item.prompt)}</td><td>${escapeHtml(item.version)}</td><td>${item.calls}</td><td>${item.failureRate}%</td><td>${item.retryRate}%</td><td>${fmtLatency(item.avgLatency)}</td><td>¥${fmtCost(item.cost)}</td><td>${item.schemaErrors}</td></tr>`).join('') : '';
     const alertRows = (s.alerts || []).map(item => `<div class="banner ${item.acknowledged ? 'good' : 'warn'} show"><strong>${escapeHtml(item.scope)}</strong> · ${escapeHtml(item.message)}（${item.calls} 次调用，阈值 ${item.threshold}%） ${item.acknowledged ? `已确认：${escapeHtml(item.acknowledgedBy || '管理员')} · ${fullTime(item.acknowledgedAt)}` : (can('editor') ? `<button class="secondary" style="margin-left:10px;padding:4px 8px" data-alert-ack="${escapeHtml(item.id)}">确认</button>` : '')}</div>`).join('');
-    const alertHistoryRows = (s.alertHistory || []).map(item => `<tr><td class="prompt-meta">${fullTime(item.acknowledgedAt)}</td><td><code>${escapeHtml(item.id)}</code></td><td>${escapeHtml(item.acknowledgedBy || '-')}</td></tr>`).join('');
+    const alertHistoryRows = (s.alertHistory || []).map(item => `<tr><td>${escapeHtml(item.scope || '-')}</td><td>${escapeHtml(item.metric || '-')}</td><td>${tag(item.status || 'active', item.status === 'recovered' ? 'green' : item.status === 'acknowledged' ? 'blue' : 'amber')}</td><td>${item.lastRate != null ? `${item.lastRate}%` : '-'}</td><td class="prompt-meta">${fullTime(item.recoveredAt || item.acknowledgedAt || item.lastSeenAt)}</td><td>${escapeHtml(item.acknowledgedBy || '-')}</td></tr>`).join('');
     const slowRows = s.slowest.length ? s.slowest.map(item => `<tr><td>${fullTime(item.at)}</td><td>${fmtLatency(item.latencyMs)}</td><td>${escapeHtml(item.model || '-')}</td><td>${escapeHtml(item.role || '-')}</td><td>${escapeHtml((item.prompts || []).join('、') || '-')}</td><td>${fmtNumber(item.inputChars)}</td><td>${item.attempts || 1}</td></tr>`).join('') : '';
 
     const rows = state.logs.map(l => {
@@ -604,7 +604,7 @@
         <div class="stat"><label>Schema 结构错误</label><strong>${fmtNumber((s.schemaFields || []).reduce((sum, item) => sum + item.count, 0))}</strong><small>${(s.schemaFields || []).slice(0, 3).map(item => `${escapeHtml(item.field)} ${item.count} 次`).join(' · ') || '无结构错误'}</small></div>
       </section>
       ${alertRows || '<div class="banner good show">当前区间没有触发异常阈值告警</div>'}
-      ${alertHistoryRows ? `<section class="panel"><div class="panel-head"><div><h2>告警确认历史</h2><p>仅记录告警 ID、确认人和时间，不保存业务输入</p></div></div><table class="table"><thead><tr><th>确认时间</th><th>告警 ID</th><th>确认人</th></tr></thead><tbody>${alertHistoryRows}</tbody></table></section>` : ''}
+      ${alertHistoryRows ? `<section class="panel"><div class="panel-head"><div><h2>告警生命周期</h2><p>同一范围与指标自动归并；低于阈值后标记为已恢复</p></div></div><table class="table"><thead><tr><th>范围</th><th>指标</th><th>状态</th><th>最近比例</th><th>状态时间</th><th>确认人</th></tr></thead><tbody>${alertHistoryRows}</tbody></table></section>` : ''}
       <div class="grid2">
         <section class="panel">
           <div class="panel-head"><div><h2>每日调用量</h2><p>失败调用叠加显示</p></div></div>
