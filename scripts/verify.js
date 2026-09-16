@@ -182,6 +182,11 @@ async function main() {
       stats.byCode.map(c => c.label).join('、'));
     check('每日序列可用于画图', Array.isArray(stats.daily) && stats.daily.length > 0);
 
+    const changes = await json(await get('/api/changes?limit=1&page=1&action=create'));
+    check('审计查询支持分页元数据', changes.page === 1 && changes.limit === 1 && typeof changes.pages === 'number');
+    check('审计查询支持动作筛选', changes.items.every(item => item.action === 'create'));
+    check('审计响应不包含 Prompt 快照正文', changes.items.every(item => !('snapshot' in item)));
+
     /* ---------- 设置钳制 ---------- */
     group('7. 设置越界被钳制');
     await postJson('/api/settings', { ...saved.settings, temperature: 99, retries: -3, logRetentionDays: 9999 }, 'PUT');

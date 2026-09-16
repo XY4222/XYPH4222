@@ -374,11 +374,12 @@ const routes = {
   }),
 
   'GET /api/changes': (req, res, url) => {
-    const items = store.listChanges(Number(url.searchParams.get('limit') || 100)).map(v => ({
+    const result = store.listChanges({ limit: url.searchParams.get('limit'), page: url.searchParams.get('page'), action: url.searchParams.get('action'), actor: url.searchParams.get('actor'), from: url.searchParams.get('from'), to: url.searchParams.get('to') });
+    const items = result.items.map(v => ({
       ...v,
       promptName: v.promptName || (v.promptId ? (store.getPrompt(v.promptId)?.name || '已删除的 Prompt') : '运行参数')
     }));
-    send(res, 200, { items });
+    send(res, 200, { ...result, items, actions: Object.entries(store.ACTION_LABEL).map(([value, label]) => ({ value, label })) });
   },
 
   'GET /api/logs': (req, res, url) => {
@@ -496,6 +497,7 @@ async function handleAuth(req, res, pathname) {
     if (!attempt || attempt.windowUntil <= now) attempt = { failures: 0, windowUntil: now + LOGIN_WINDOW_MS, blockedUntil: 0 };
     const result = auth.login(body.username, body.password);
     if (!result) {
+      store.pushAuditEvent('auth_login_failed', String(body.username || '').trim().slice(0, 80) || 'unknown', '后台登录', '登录失败');
       attempt.failures += 1;
       if (attempt.failures >= LOGIN_MAX_FAILURES) attempt.blockedUntil = now + LOGIN_BLOCK_MS;
       loginAttempts.set(key, attempt);
@@ -504,10 +506,13 @@ async function handleAuth(req, res, pathname) {
       return send(res, 401, { error: '用户名或密码错误', code: 'INVALID_CREDENTIALS' });
     }
     loginAttempts.delete(key);
+    store.pushAuditEvent('auth_login_success', result.user.username, '后台登录', `角色 ${result.user.role}`);
     return send(res, 200, { authenticated: true, user: result.user }, { 'Set-Cookie': auth.cookie(result.token, req) });
   }
   if (pathname === '/api/auth/logout' && req.method === 'POST') {
+    const current = auth.current(req);
     auth.revoke(req);
+    if (current) store.pushAuditEvent('auth_logout', current.username, '后台退出', '会话已撤销');
     return send(res, 200, { ok: true }, { 'Set-Cookie': auth.cookie('', req, 0) });
   }
   return send(res, 405, { error: '请求方法不支持', code: 'METHOD_NOT_ALLOWED' });

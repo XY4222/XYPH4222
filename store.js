@@ -457,7 +457,8 @@ const ACTION_LABEL = {
   seed: '初始化', create: '新建', update: '修改内容', meta: '修改描述', scope: '调整归属步骤',
   status: '修改状态', enable: '启用', disable: '停用', rollback: '恢复为草稿', delete: '删除',
   submit_review: '提交审核', reject_review: '审核驳回', publish: '发布生产', production_rollback: '生产回滚',
-  test_case_create: '保存测试案例', test_case_delete: '删除测试案例', feedback_update: '更新质量反馈'
+  test_case_create: '保存测试案例', test_case_delete: '删除测试案例', feedback_update: '更新质量反馈',
+  auth_login_failed: '登录失败', auth_login_success: '登录成功', auth_logout: '退出登录'
 };
 
 function pushAuditEvent(action, actor, subject, note) {
@@ -483,8 +484,20 @@ function getVersion(vid) {
   return readJson(FILES.versions, []).find(v => v.vid === vid) || null;
 }
 
-function listChanges(limit = 100) {
-  return listVersions(null, limit);
+function listChanges(options = {}) {
+  const input = typeof options === 'number' ? { limit: options } : options;
+  const limit = Math.min(Math.max(Number(input.limit) || 100, 1), 500);
+  const page = Math.max(Number(input.page) || 1, 1);
+  const action = String(input.action || '').trim();
+  const actor = String(input.actor || '').trim().toLowerCase();
+  const from = input.from ? new Date(input.from).getTime() : 0;
+  const to = input.to ? new Date(input.to).getTime() + 86400000 : 0;
+  const all = listVersions(null, Number.MAX_SAFE_INTEGER).filter(item => {
+    const at = new Date(item.at).getTime();
+    return (!action || item.action === action) && (!actor || String(item.actor || '').toLowerCase().includes(actor)) && (!from || at >= from) && (!to || at < to);
+  });
+  const items = all.slice((page - 1) * limit, page * limit).map(item => { const { snapshot, ...safe } = item; return safe; });
+  return { items, total: all.length, page, limit, pages: Math.max(1, Math.ceil(all.length / limit)) };
 }
 
 function changesInLastDays(days) {
@@ -1022,6 +1035,7 @@ module.exports = {
   ensureData, getPrompts, getPrompt, listPrompts, queryPrompts, summarize, detail, createPrompt, updatePrompt, setEnabled,
   removePrompt, rollbackPrompt, submitPromptReview, rejectPromptReview, publishPrompt, rollbackProduction,
   listVersions, getVersion, listChanges, changesInLastDays,
+  pushAuditEvent,
   getSettings, saveSettings, appendLog, readLogs, pruneLogs, logStats, buildPromptConfig,
   listTestCases, createTestCase, removeTestCase, appendPromptTest, listPromptTests, buildPromptConfigForTest,
   regressionSuiteKey, appendRegression, listRegressions,
