@@ -31,6 +31,27 @@ const loginAttempts = new Map();
 const LOGIN_WINDOW_MS = 10 * 60 * 1000;
 const LOGIN_BLOCK_MS = 15 * 60 * 1000;
 const LOGIN_MAX_FAILURES = 5;
+const ANALYZE_WINDOW_MS = Math.max(1000, Number(process.env.ANALYZE_RATE_WINDOW_MS) || 60 * 1000);
+const ANALYZE_MAX_PER_IP = Math.max(1, Number(process.env.ANALYZE_RATE_MAX) || 20);
+const ANALYZE_MAX_CONCURRENT = Math.max(1, Number(process.env.ANALYZE_MAX_CONCURRENT) || 4);
+const analyzeAttempts = new Map();
+let analyzeInFlight = 0;
+
+function analyzeAdmission(req) {
+  const forwarded = process.env.TRUST_PROXY === 'true' ? req.headers['x-forwarded-for'] : '';
+  const ip = String(forwarded || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
+  const now = Date.now();
+  if (analyzeAttempts.size > 5000) {
+    for (const [key, value] of analyzeAttempts) if (value.resetAt <= now) analyzeAttempts.delete(key);
+  }
+  const current = analyzeAttempts.get(ip);
+  if (!current || current.resetAt <= now) analyzeAttempts.set(ip, { count: 1, resetAt: now + ANALYZE_WINDOW_MS });
+  else if (current.count >= ANALYZE_MAX_PER_IP) return { ok: false, retryAfter: Math.ceil((current.resetAt - now) / 1000) };
+  else current.count += 1;
+  if (analyzeInFlight >= ANALYZE_MAX_CONCURRENT) return { ok: false, retryAfter: 5, busy: true };
+  analyzeInFlight += 1;
+  return { ok: true };
+}
 
 function send(res, status, payload, headers = {}) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...headers });
@@ -81,6 +102,7 @@ function degradationFor(code, retryAfter = 0) {
     UPSTREAM_TIMEOUT: { state: 'timeout', retryable: true, message: '模型响应超时，可重试', defaultWait: 3 },
     MODEL_UNAVAILABLE: { state: 'model_unavailable', retryable: true, message: '模型服务暂时不可用，可稍后重试', defaultWait: 10 },
     MISSING_API_KEY: { state: 'configuration_error', retryable: false, message: '分析服务尚未完成配置' },
+    BUDGET_EXCEEDED: { state: 'budget_exhausted', retryable: false, message: '今日分析额度已用尽，请稍后再试' },
     MODEL_AUTH_ERROR: { state: 'configuration_error', retryable: false, message: '模型服务鉴权失败，请联系管理员' },
     MODEL_REQUEST_REJECTED: { state: 'request_rejected', retryable: false, message: '模型服务拒绝了本次请求，请联系管理员检查配置' },
     EMPTY_MODEL_OUTPUT: { state: 'invalid_response', retryable: true, message: '模型未返回有效结果，可重试' },
@@ -94,12 +116,18 @@ function degradationFor(code, retryAfter = 0) {
 }
 
 async function handleAnalyze(req, res) {
+  const admission = analyzeAdmission(req);
+  if (!admission.ok) {
+    res.setHeader('Retry-After', String(admission.retryAfter));
+    return send(res, 429, { error: admission.busy ? '当前分析请求较多，请稍后重试' : '分析请求频率过高，请稍后重试', code: 'RATE_LIMIT', degradation: degradationFor('RATE_LIMIT', admission.retryAfter) });
+  }
   const started = Date.now();
-  const settings = store.getSettings();
+  let settings = null;
   let input = null;
   let resolved = null;
 
   try {
+    settings = store.getSettings();
     input = await readBody(req, BODY_LIMIT);
     if (!String(input.role || '').trim() || !String(input.jd || '').trim() || !String(input.resume || '').trim()) {
       const runId = record({ ok: false, code: 'BAD_REQUEST', error: '缺少目标岗位、JD 或原始简历', latencyMs: Date.now() - started });
@@ -108,6 +136,11 @@ async function handleAnalyze(req, res) {
     if (!settings.analyzeEnabled) {
       const runId = record({ ok: false, code: 'DISABLED', error: '管理员已暂停分析服务', latencyMs: Date.now() - started, role: input.role });
       return send(res, 503, { error: '管理员已暂停分析服务', code: 'DISABLED', runId, degradation: degradationFor('DISABLED') });
+    }
+    const budget = store.costBudgetStatus();
+    if (budget.exhausted) {
+      const runId = record({ ok: false, code: 'BUDGET_EXCEEDED', error: '近 24 小时模型调用预算已用尽', latencyMs: Date.now() - started, role: input.role });
+      return send(res, 503, { error: '今日分析额度已用尽，请稍后再试', code: 'BUDGET_EXCEEDED', runId, budget, degradation: degradationFor('BUDGET_EXCEEDED') });
     }
 
     // Prompt 配置一律以服务端为准，前端不需要自己拼装，也就不会出现浏览器与服务端配置不一致
@@ -141,7 +174,7 @@ async function handleAnalyze(req, res) {
     if (degradation.retryAfterSeconds > 0) res.setHeader('Retry-After', String(degradation.retryAfterSeconds));
     const safeError = ['BAD_REQUEST', 'PAYLOAD_TOO_LARGE'].includes(code) ? (error.message || degradation.message) : degradation.message;
     return send(res, error.statusCode || 500, { error: safeError, code, runId, degradation });
-  }
+  } finally { analyzeInFlight = Math.max(0, analyzeInFlight - 1); }
 }
 
 function mockPromptTestResult(variant, resolved) {
@@ -282,6 +315,8 @@ const routes = {
   'GET /api/health': (req, res) => send(res, 200, { ok: true, at: new Date().toISOString() }),
 
   'GET /api/overview': (req, res) => send(res, 200, store.overview()),
+  'GET /api/cost-budget': (req, res) => send(res, 200, store.costBudgetStatus()),
+  'GET /api/system-health': (req, res) => send(res, 200, store.systemHealth()),
   'GET /api/dependencies': (req, res) => send(res, 200, store.dependencyView()),
 
   'GET /api/prompts': (req, res, url) => {
@@ -307,7 +342,7 @@ const routes = {
     const resolved = store.buildPromptConfig();
     send(res, 200, {
       prompts: resolved.config, truncated: resolved.truncated, dropped: resolved.dropped,
-      enabledCount: resolved.enabledCount, maxChars: store.getSettings().promptMaxChars
+      enabledCount: resolved.enabledCount, maxChars: store.getSettings().promptMaxChars, canary: resolved.canary || []
     });
   },
 
@@ -315,6 +350,12 @@ const routes = {
     const prompt = store.getPrompt(params.id);
     if (!prompt) return send(res, 404, { error: 'Prompt 不存在' });
     send(res, 200, { prompt, versions: store.listVersions(params.id, 50) });
+  },
+
+  'GET /api/prompts/:id/release-checklist': (req, res, url, params) => {
+    const prompt = store.getPrompt(params.id);
+    if (!prompt) return send(res, 404, { error: 'Prompt 不存在', code: 'NOT_FOUND' });
+    send(res, 200, { checklist: store.releaseChecklist(prompt) });
   },
 
   'POST /api/prompts': async (req, res) => {
@@ -365,6 +406,40 @@ const routes = {
     send(res, 200, { prompt });
   },
 
+  'GET /api/prompts/:id/canary': (req, res, url, params) => {
+    const prompt = store.getPrompt(params.id);
+    if (!prompt) return send(res, 404, { error: 'Prompt 不存在', code: 'NOT_FOUND' });
+    send(res, 200, { canary: store.canaryView(prompt) });
+  },
+
+  'POST /api/prompts/:id/canary/start': async (req, res, url, params) => {
+    const body = await readBody(req, ADMIN_LIMIT);
+    const prompt = store.startCanary(params.id, { ...body, actor: req.auth.username });
+    if (!prompt) return send(res, 404, { error: 'Prompt 不存在', code: 'NOT_FOUND' });
+    send(res, 200, { prompt, canary: store.canaryView(prompt) });
+  },
+
+  'POST /api/prompts/:id/canary/stop': async (req, res, url, params) => {
+    const body = await readBody(req, ADMIN_LIMIT);
+    const prompt = store.stopCanary(params.id, { ...body, actor: req.auth.username });
+    if (!prompt) return send(res, 404, { error: 'Prompt 不存在', code: 'NOT_FOUND' });
+    send(res, 200, { prompt, canary: null });
+  },
+
+  'POST /api/prompts/:id/canary/promote': async (req, res, url, params) => {
+    const body = await readBody(req, ADMIN_LIMIT);
+    const prompt = store.promoteCanary(params.id, { ...body, actor: req.auth.username });
+    if (!prompt) return send(res, 404, { error: 'Prompt 不存在', code: 'NOT_FOUND' });
+    send(res, 200, { prompt, canary: null });
+  },
+
+  'PUT /api/prompts/:id/canary/traffic': async (req, res, url, params) => {
+    const body = await readBody(req, ADMIN_LIMIT);
+    const prompt = store.setCanaryTraffic(params.id, body.trafficPercent, req.auth.username);
+    if (!prompt) return send(res, 404, { error: 'Prompt 不存在', code: 'NOT_FOUND' });
+    send(res, 200, { prompt, canary: store.canaryView(prompt) });
+  },
+
   'POST /api/prompts/:id/production-rollback': async (req, res, url, params) => {
     const body = await readBody(req, ADMIN_LIMIT);
     if (!body.vid) return send(res, 400, { error: '缺少目标版本 vid' });
@@ -384,6 +459,12 @@ const routes = {
   'GET /api/versions': (req, res, url) => send(res, 200, {
     items: store.listVersions(url.searchParams.get('promptId'), Number(url.searchParams.get('limit') || 100))
   }),
+
+  'GET /api/prompts/:id/release-comparison': (req, res, url, params) => {
+    const result = store.releaseComparison(params.id, url.searchParams.get('version'), url.searchParams.get('beforeDays'), url.searchParams.get('afterDays'));
+    if (!result) return send(res, 404, { error: 'Prompt 不存在', code: 'NOT_FOUND' });
+    send(res, 200, result);
+  },
 
   'GET /api/changes': (req, res, url) => {
     const result = store.listChanges({ limit: url.searchParams.get('limit'), page: url.searchParams.get('page'), action: url.searchParams.get('action'), actor: url.searchParams.get('actor'), from: url.searchParams.get('from'), to: url.searchParams.get('to') });
@@ -412,12 +493,28 @@ const routes = {
     });
   },
 
+  'GET /api/logs/:id': (req, res, url, params) => {
+    const entry = store.findLog(params.id);
+    if (!entry) return send(res, 404, { error: '运行日志不存在', code: 'LOG_NOT_FOUND' });
+    send(res, 200, { item: store.safeLogDetail(entry) });
+  },
+
+  'GET /api/tasks': (req, res, url) => send(res, 200, store.listTasks({
+    page: url.searchParams.get('page'), limit: url.searchParams.get('limit'),
+    status: url.searchParams.get('status') || undefined,
+    role: url.searchParams.get('role') || undefined,
+    days: Number(url.searchParams.get('days') || 0)
+  })),
+
   'GET /api/logs/stats': (req, res, url) => send(res, 200, store.logStats(Number(url.searchParams.get('days') || 7), {
     model: url.searchParams.get('model') || undefined,
     prompt: url.searchParams.get('prompt') || undefined,
     role: url.searchParams.get('role') || undefined,
     minLatency: Number(url.searchParams.get('minLatency') || 0)
   })),
+
+  'GET /api/quality': (req, res, url) => send(res, 200, store.qualityStats(Number(url.searchParams.get('days') || 7))),
+  'GET /api/experiments': (req, res, url) => send(res, 200, store.experiments(Number(url.searchParams.get('days') || 7))),
 
   'GET /api/alerts': (req, res, url) => send(res, 200, { items: store.listAlertHistory(Number(url.searchParams.get('limit') || 100)) }),
   'POST /api/alerts/:id/ack': (req, res, url, params) => send(res, 200, { item: store.acknowledgeAlert(params.id, req.auth.username) }),
@@ -442,6 +539,7 @@ const routes = {
   'GET /api/regressions': (req, res, url) => send(res, 200, {
     items: store.listRegressions(url.searchParams.get('promptId'), Number(url.searchParams.get('limit') || 30))
   }),
+  'GET /api/regression-center': (req, res) => send(res, 200, store.regressionCenter()),
 
   'GET /api/feedback': (req, res, url) => send(res, 200, {
     items: store.listFeedback({ status: url.searchParams.get('status') || undefined, rating: url.searchParams.get('rating') || undefined, prompt: url.searchParams.get('prompt') || undefined, limit: Number(url.searchParams.get('limit') || 200) }),
@@ -461,6 +559,13 @@ const routes = {
   'PUT /api/feedback/:id': async (req, res, url, params) => {
     const body = await readBody(req, ADMIN_LIMIT);
     const item = store.updateFeedback(params.id, body, req.auth.username);
+    if (!item) return send(res, 404, { error: '质量反馈不存在', code: 'NOT_FOUND' });
+    send(res, 200, { item });
+  },
+
+  'POST /api/feedback/:id/link': async (req, res, url, params) => {
+    const body = await readBody(req, ADMIN_LIMIT);
+    const item = store.linkFeedback(params.id, body, req.auth.username);
     if (!item) return send(res, 404, { error: '质量反馈不存在', code: 'NOT_FOUND' });
     send(res, 200, { item });
   },
@@ -491,10 +596,16 @@ function requiredRole(method, pathname) {
   if (method === 'POST' && /^\/api\/templates\/[^/]+\/rollback$/.test(pathname)) return 'editor';
   if (method === 'PUT' && /^\/api\/prompts\/[^/]+$/.test(pathname)) return 'editor';
   if (method === 'POST' && /^\/api\/prompts\/[^/]+\/(toggle|rollback|submit-review)$/.test(pathname)) return 'editor';
+  if (method === 'GET' && /^\/api\/prompts\/[^/]+\/release-checklist$/.test(pathname)) return 'viewer';
+  if (method === 'GET' && /^\/api\/prompts\/[^/]+\/canary$/.test(pathname)) return 'viewer';
+  if (method === 'POST' && /^\/api\/prompts\/[^/]+\/canary\/(start|stop)$/.test(pathname)) return 'editor';
+  if (method === 'PUT' && /^\/api\/prompts\/[^/]+\/canary\/traffic$/.test(pathname)) return 'editor';
+  if (method === 'POST' && /^\/api\/prompts\/[^/]+\/canary\/promote$/.test(pathname)) return 'admin';
   if (method === 'POST' && /^\/api\/prompts\/[^/]+\/test$/.test(pathname)) return 'editor';
   if (method === 'POST' && /^\/api\/prompts\/[^/]+\/regression$/.test(pathname)) return 'editor';
   if (method === 'POST' && pathname === '/api/test-cases') return 'editor';
   if ((method === 'POST' && pathname === '/api/feedback') || (method === 'PUT' && /^\/api\/feedback\/[^/]+$/.test(pathname))) return 'editor';
+  if (method === 'POST' && /^\/api\/feedback\/[^/]+\/link$/.test(pathname)) return 'editor';
   if (method === 'POST' && pathname === '/api/rules') return 'editor';
   if (method === 'PUT' && /^\/api\/rules\/[^/]+$/.test(pathname)) return 'editor';
   if (method === 'POST' && /^\/api\/alerts\/[^/]+\/ack$/.test(pathname)) return 'editor';
@@ -597,7 +708,7 @@ http.createServer(async (req, res) => {
     try { await match.handler(req, res, url, match.params); }
     catch (error) {
       console.error(`[server] ${req.method} ${pathname} 失败：${error.message}`);
-      if (!res.headersSent) send(res, error.statusCode || 500, { error: error.message || '服务端错误', code: error.code || 'SERVER_ERROR' });
+      if (!res.headersSent) send(res, error.statusCode || 500, { error: error.message || '服务端错误', code: error.code || 'SERVER_ERROR', ...(error.checklist ? { checklist: error.checklist } : {}) });
     }
     return;
   }

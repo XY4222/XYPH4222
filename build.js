@@ -68,11 +68,32 @@ const files = ${embed(files)};
 const SYSTEM_PROMPT = ${embed(SYSTEM_PROMPT)};
 const PROMPT_CONFIG = ${embed(baked.config)};
 const PROMPT_META = ${embed(meta)};
+const rateBuckets = new Map();
+let analyzeInFlight = 0;
 
-function json(payload, status) {
+function clientKey(request) {
+  return request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For')?.split(',')[0].trim() || 'unknown';
+}
+
+function admitAnalyze(request, env) {
+  const windowMs = Math.max(1000, Number(env.ANALYZE_RATE_WINDOW_MS || 60000));
+  const maxPerIp = Math.max(1, Number(env.ANALYZE_RATE_MAX || 20));
+  const maxConcurrent = Math.max(1, Number(env.ANALYZE_MAX_CONCURRENT || 4));
+  const now = Date.now();
+  const key = clientKey(request);
+  const bucket = rateBuckets.get(key);
+  if (!bucket || bucket.resetAt <= now) rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
+  else if (bucket.count >= maxPerIp) return Math.ceil((bucket.resetAt - now) / 1000);
+  else bucket.count += 1;
+  if (analyzeInFlight >= maxConcurrent) return 5;
+  analyzeInFlight += 1;
+  return 0;
+}
+
+function json(payload, status, extraHeaders = {}) {
   return new Response(JSON.stringify(payload), {
     status: status || 200,
-    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }
+    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...extraHeaders }
   });
 }
 
@@ -138,7 +159,10 @@ function traceFailure(runId, code, attempts) {
 }
 
 async function handleAnalyze(request, env) {
+  const retryAfter = admitAnalyze(request, env);
+  if (retryAfter) return json({ error: '分析请求较多，请稍后重试', code: 'RATE_LIMIT', degradation: degradationFor('RATE_LIMIT', retryAfter) }, 429, { 'retry-after': String(retryAfter) });
   const runId = 'edge-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);
+  try {
   if (!env.DEEPSEEK_API_KEY) {
     traceFailure(runId, 'MISSING_API_KEY', 0);
     return json({ error: '服务端尚未配置 DEEPSEEK_API_KEY', code: 'MISSING_API_KEY', attempts: 0, runId, degradation: degradationFor('MISSING_API_KEY') }, 503);
@@ -147,7 +171,10 @@ async function handleAnalyze(request, env) {
     traceFailure(runId, 'DISABLED', 0);
     return json({ error: '管理员已暂停分析服务', code: 'DISABLED', attempts: 0, runId, degradation: degradationFor('DISABLED') }, 503);
   }
-  const input = await request.json();
+  const raw = await request.text();
+  if (raw.length > 120000) return json({ error: '输入内容超过允许长度，请精简后重试', code: 'PAYLOAD_TOO_LARGE', attempts: 0, runId, degradation: degradationFor('PAYLOAD_TOO_LARGE') }, 413);
+  let input;
+  try { input = JSON.parse(raw || '{}'); } catch { return json({ error: '请求 JSON 格式错误', code: 'BAD_REQUEST', attempts: 0, runId, degradation: degradationFor('BAD_REQUEST') }, 400); }
   if (!String(input.role || '').trim() || !String(input.jd || '').trim() || !String(input.resume || '').trim()) {
     traceFailure(runId, 'BAD_REQUEST', 0);
     return json({ error: '缺少目标岗位、JD 或原始简历', code: 'BAD_REQUEST', attempts: 0, runId, degradation: degradationFor('BAD_REQUEST') }, 400);
@@ -207,6 +234,7 @@ async function handleAnalyze(request, env) {
   const degradation = degradationFor(code, lastError?.retryAfter);
   traceFailure(runId, code, attempts);
   return json({ error: degradation.message + (attempts > 1 ? '，已自动重试' : ''), code, attempts, runId, degradation }, status);
+  } finally { analyzeInFlight = Math.max(0, analyzeInFlight - 1); }
 }
 
 export default {

@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const https = require('https');
+const crypto = require('crypto');
 
 /**
  * 服务端持久化层。
@@ -54,12 +55,19 @@ const DEFAULT_SETTINGS = {
   promptMaxCount: 20,
   inputPricePerM: 2,
   outputPricePerM: 8,
+  dailyCostBudget: 0,
   logRetentionDays: 30,
   alertFailureRate: 30,
   alertSchemaErrorRate: 10,
   alertRetryRate: 50,
   alertMinCalls: 10,
-  alertNotificationsEnabled: false
+  alertNotificationsEnabled: false,
+  canaryFailureRate: 30,
+  canarySchemaErrorRate: 10,
+  canaryMinCalls: 10,
+  canaryAutoStop: true,
+  releaseFreeze: false,
+  releaseFreezeReason: ''
 };
 
 const SEED = [
@@ -230,13 +238,29 @@ function rollbackTemplate(id, versionId, actor) {
   const template = templates.find(item => item.id === id);
   const target = listTemplateVersions(id).find(item => item.id === versionId);
   if (!template || !target) return null;
-  Object.assign(template, target.snapshot);
-  template.version = bumpVersion(template.version || 'v1.0');
-  template.updatedAt = new Date().toISOString(); template.updatedBy = actor;
-  pushTemplateVersion(template, actor, 'rollback');
-  pushAuditEvent('template_rollback', actor, `模板：${template.name}`, `恢复 ${target.version} 为 ${template.version}`);
-  writeJson(FILES.templates, templates);
-  return template;
+  const previousTemplates = JSON.stringify(templates);
+  const previousTemplateVersions = JSON.stringify(readJson(FILES.templateVersions, []));
+  const previousVersions = JSON.stringify(readJson(FILES.versions, []));
+  const nextTemplate = { ...template, ...target.snapshot };
+  nextTemplate.version = bumpVersion(template.version || 'v1.0');
+  nextTemplate.updatedAt = new Date().toISOString(); nextTemplate.updatedBy = actor;
+  const templateVersions = JSON.parse(previousTemplateVersions);
+  templateVersions.push({ id: `tv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`, templateId: nextTemplate.id, version: nextTemplate.version, action: 'rollback', actor, at: nextTemplate.updatedAt, snapshot: { name: nextTemplate.name, desc: nextTemplate.desc, content: nextTemplate.content, category: nextTemplate.category || '其他', tags: nextTemplate.tags || [], variables: nextTemplate.variables || [] } });
+  const nextTemplates = templates.map(item => item.id === id ? nextTemplate : item);
+  const versions = JSON.parse(previousVersions);
+  versions.push({ vid: `audit-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`, promptId: null, promptName: `模板：${nextTemplate.name}`, version: '-', action: 'template_rollback', actor: actor || '管理员', at: nextTemplate.updatedAt, note: clip(`恢复 ${target.version} 为 ${nextTemplate.version}`, 300) });
+  try {
+    writeJson(FILES.templates, nextTemplates);
+    writeJson(FILES.templateVersions, templateVersions);
+    writeJson(FILES.versions, versions);
+  } catch (error) {
+    // Restore every file touched by this operation so a failed rollback cannot look successful.
+    try { writeJson(FILES.templates, JSON.parse(previousTemplates)); } catch {}
+    try { writeJson(FILES.templateVersions, JSON.parse(previousTemplateVersions)); } catch {}
+    try { writeJson(FILES.versions, JSON.parse(previousVersions)); } catch {}
+    throw error;
+  }
+  return nextTemplate;
 }
 
 function archiveTemplate(id, archived, actor) {
@@ -301,6 +325,7 @@ function getPrompt(id) {
  */
 function summarize(p) {
   const { content, ...rest } = p;
+  if (rest.canary) rest.canary = canaryView(p);
   return {
     ...rest,
     contentPreview: String(content || '').slice(0, 120),
@@ -311,6 +336,127 @@ function summarize(p) {
 /** 单条接口返回完整对象：编辑抽屉、版本对比都需要正文。 */
 function detail(p) {
   return p ? { ...p, contentLength: String(p.content || '').length } : null;
+}
+
+function canaryView(prompt) {
+  if (!prompt?.canary) return null;
+  const c = prompt.canary;
+  return {
+    active: true,
+    version: c.version,
+    trafficPercent: c.trafficPercent,
+    startedAt: c.startedAt,
+    startedBy: c.startedBy,
+    sourceVersion: c.sourceVersion || prompt.publishedVersion,
+    stopReason: c.stopReason || null,
+    metrics: canaryMetrics(prompt)
+  };
+}
+
+function canaryMetrics(prompt) {
+  const canary = prompt?.canary;
+  if (!canary) return { calls: 0, failed: 0, schemaErrors: 0, failureRate: 0, schemaErrorRate: 0 };
+  const version = String(canary.version);
+  const rows = readLogs({ limit: Number.MAX_SAFE_INTEGER }).rows.filter(row =>
+    (row.promptVersions || []).some(item => String(item.name) === String(prompt.name) && String(item.version) === version)
+  );
+  const failed = rows.filter(row => !row.ok).length;
+  const schemaErrors = rows.filter(row => (row.validationErrors || []).length > 0).length;
+  return {
+    calls: rows.length, failed, schemaErrors,
+    failureRate: rows.length ? Number((failed / rows.length * 100).toFixed(1)) : 0,
+    schemaErrorRate: rows.length ? Number((schemaErrors / rows.length * 100).toFixed(1)) : 0
+  };
+}
+
+function startCanary(id, input = {}) {
+  assertReleaseOpen();
+  const prompts = getPrompts();
+  const prompt = prompts.find(item => String(item.id) === String(id));
+  if (!prompt) return null;
+  if (!prompt.publishedSnapshot) throw Object.assign(new Error('没有生产版本，不能启动灰度'), { statusCode: 409, code: 'NO_PUBLISHED_VERSION' });
+  if (prompt.canary) throw Object.assign(new Error('该 Prompt 已存在进行中的灰度'), { statusCode: 409, code: 'CANARY_ALREADY_ACTIVE' });
+  if (!String(prompt.content || '').trim()) throw Object.assign(new Error('Prompt 内容为空，不能灰度'), { statusCode: 400, code: 'EMPTY_PROMPT' });
+  assertRegressionGate(prompt);
+  const trafficPercent = Math.min(Math.max(Number(input.trafficPercent) || 10, 1), 100);
+  const now = new Date().toISOString();
+  prompt.canary = {
+    version: `${prompt.version}-canary`, snapshot: snapshotOf(prompt), trafficPercent,
+    startedAt: now, startedBy: clip(input.actor || '管理员', 80), sourceVersion: prompt.publishedVersion
+  };
+  writeJson(FILES.prompts, prompts);
+  pushAuditEvent('canary_start', input.actor, prompt.name, `启动 ${prompt.canary.version}，流量 ${trafficPercent}%`);
+  return detail(prompt);
+}
+
+function stopCanary(id, input = {}) {
+  const prompts = getPrompts();
+  const prompt = prompts.find(item => String(item.id) === String(id));
+  if (!prompt) return null;
+  if (!prompt.canary) throw Object.assign(new Error('该 Prompt 没有进行中的灰度'), { statusCode: 409, code: 'CANARY_NOT_ACTIVE' });
+  const version = prompt.canary.version;
+  const reason = clip(input.reason || '管理员停止灰度', 200);
+  prompt.canary = null;
+  writeJson(FILES.prompts, prompts);
+  pushAuditEvent('canary_stop', input.actor, prompt.name, `${version}：${reason}`);
+  return detail(prompt);
+}
+
+function promoteCanary(id, input = {}) {
+  assertReleaseOpen();
+  const prompts = getPrompts();
+  const prompt = prompts.find(item => String(item.id) === String(id));
+  if (!prompt) return null;
+  if (!prompt.canary) throw Object.assign(new Error('该 Prompt 没有进行中的灰度'), { statusCode: 409, code: 'CANARY_NOT_ACTIVE' });
+  const candidate = prompt.canary;
+  const now = new Date().toISOString();
+  Object.assign(prompt, candidate.snapshot);
+  prompt.version = String(candidate.version).replace(/-canary$/, '');
+  prompt.publishedSnapshot = { ...candidate.snapshot };
+  prompt.publishedVersion = prompt.version;
+  prompt.publishedAt = now;
+  prompt.publishedBy = clip(input.actor || '管理员', 80);
+  prompt.releaseStatus = 'published';
+  prompt.reviewNote = clip(input.note, 200);
+  prompt.updatedAt = now;
+  prompt.updatedLabel = '刚刚';
+  prompt.canary = null;
+  writeJson(FILES.prompts, prompts);
+  pushVersion(prompt, 'publish', input.actor, input.note || `灰度 ${candidate.version} 全量发布`);
+  return detail(prompt);
+}
+
+function setCanaryTraffic(id, trafficPercent, actor) {
+  const prompts = getPrompts();
+  const prompt = prompts.find(item => String(item.id) === String(id));
+  if (!prompt) return null;
+  if (!prompt.canary) throw Object.assign(new Error('该 Prompt 没有进行中的灰度'), { statusCode: 409, code: 'CANARY_NOT_ACTIVE' });
+  const value = Math.min(Math.max(Number(trafficPercent) || 0, 1), 100);
+  prompt.canary.trafficPercent = value;
+  writeJson(FILES.prompts, prompts);
+  pushAuditEvent('canary_traffic', actor, prompt.name, `灰度流量调整为 ${value}%`);
+  return detail(prompt);
+}
+
+function evaluateCanaries() {
+  const prompts = getPrompts();
+  const settings = getSettings();
+  let changed = false;
+  for (const prompt of prompts) {
+    if (!prompt.canary || settings.canaryAutoStop !== true) continue;
+    const metrics = canaryMetrics(prompt);
+    if (metrics.calls < Number(settings.canaryMinCalls || 10)) continue;
+    const failureLimit = Number(settings.canaryFailureRate || 30);
+    const schemaLimit = Number(settings.canarySchemaErrorRate || 10);
+    if ((failureLimit > 0 && metrics.failureRate >= failureLimit) || (schemaLimit > 0 && metrics.schemaErrorRate >= schemaLimit)) {
+      const reason = `自动熔断：${metrics.calls} 次调用，失败率 ${metrics.failureRate}%，Schema 错误率 ${metrics.schemaErrorRate}%`;
+      const version = prompt.canary.version;
+      prompt.canary = null;
+      pushAuditEvent('canary_auto_stop', '系统', prompt.name, `${version}：${reason}`);
+      changed = true;
+    }
+  }
+  if (changed) writeJson(FILES.prompts, prompts);
 }
 
 function listPrompts() {
@@ -468,7 +614,7 @@ function submitPromptReview(id, input = {}) {
   if (prompt.releaseStatus === 'published') {
     throw Object.assign(new Error('当前没有待审核的草稿'), { statusCode: 409, code: 'NO_DRAFT' });
   }
-  assertRegressionGate(prompt);
+  assertReleaseChecklist(prompt);
   prompt.releaseStatus = 'review';
   prompt.reviewNote = clip(input.note, 200);
   prompt.updatedAt = new Date().toISOString();
@@ -485,16 +631,19 @@ function rejectPromptReview(id, input = {}) {
   if (prompt.releaseStatus !== 'review') {
     throw Object.assign(new Error('只有待审核版本可以驳回'), { statusCode: 409, code: 'NOT_IN_REVIEW' });
   }
+  const note = clip(input.note, 200).trim();
+  if (!note) throw Object.assign(new Error('驳回审核必须填写理由'), { statusCode: 400, code: 'REJECTION_NOTE_REQUIRED' });
   prompt.releaseStatus = 'draft';
-  prompt.reviewNote = clip(input.note, 200);
+  prompt.reviewNote = note;
   prompt.updatedAt = new Date().toISOString();
   prompt.updatedLabel = '刚刚';
   writeJson(FILES.prompts, prompts);
-  pushVersion(prompt, 'reject_review', input.actor, input.note || '审核驳回');
+  pushVersion(prompt, 'reject_review', input.actor, note);
   return detail(prompt);
 }
 
 function publishPrompt(id, input = {}) {
+  assertReleaseOpen();
   const prompts = getPrompts();
   const prompt = prompts.find(p => String(p.id) === String(id));
   if (!prompt) return null;
@@ -504,7 +653,7 @@ function publishPrompt(id, input = {}) {
   if (!String(prompt.content || '').trim()) {
     throw Object.assign(new Error('Prompt 内容为空，不能发布'), { statusCode: 400, code: 'EMPTY_PROMPT' });
   }
-  assertRegressionGate(prompt);
+  assertReleaseChecklist(prompt);
   prompt.publishedSnapshot = snapshotOf(prompt);
   prompt.publishedVersion = prompt.version;
   prompt.publishedAt = new Date().toISOString();
@@ -519,6 +668,7 @@ function publishPrompt(id, input = {}) {
 }
 
 function rollbackProduction(id, vid, input = {}) {
+  assertReleaseOpen();
   const versions = readJson(FILES.versions, []);
   const target = versions.find(v => v.vid === vid && String(v.promptId) === String(id) && v.snapshot
     && ['seed', 'publish', 'production_rollback'].includes(v.action));
@@ -553,7 +703,7 @@ const ACTION_LABEL = {
   test_case_create: '保存测试案例', test_case_delete: '删除测试案例', feedback_update: '更新质量反馈',
   auth_login_failed: '登录失败', auth_login_success: '登录成功', auth_logout: '退出登录',
   template_update: '编辑模板', template_archive: '归档模板', template_restore: '恢复模板', template_rollback: '回滚模板',
-  alert_ack: '确认告警'
+  alert_ack: '确认告警', canary_start: '启动灰度', canary_stop: '停止灰度', canary_traffic: '调整灰度流量', canary_auto_stop: '灰度自动熔断'
 };
 
 function pushAuditEvent(action, actor, subject, note) {
@@ -606,6 +756,13 @@ function getSettings() {
   return { ...DEFAULT_SETTINGS, ...readJson(FILES.settings, {}) };
 }
 
+function assertReleaseOpen() {
+  const settings = getSettings();
+  if (settings.releaseFreeze === true) {
+    throw Object.assign(new Error(settings.releaseFreezeReason || '发布已冻结，暂不允许生产变更'), { statusCode: 423, code: 'RELEASE_FROZEN' });
+  }
+}
+
 function saveSettings(patch, actor) {
   const next = { ...getSettings(), ...patch };
   // 这些字段是服务端运行状态，只读，不能被管理端回写到配置文件。
@@ -614,8 +771,9 @@ function saveSettings(patch, actor) {
   const numeric = {
     temperature: [0, 2], maxTokens: [256, 32000], timeoutMs: [5000, 300000], retries: [0, 5],
     promptMaxChars: [200, 60000], promptMaxCount: [1, 50], inputPricePerM: [0, 10000],
-    outputPricePerM: [0, 10000], logRetentionDays: [1, 365], alertFailureRate: [0, 100],
-    alertSchemaErrorRate: [0, 100], alertRetryRate: [0, 100], alertMinCalls: [1, 10000]
+    outputPricePerM: [0, 10000], dailyCostBudget: [0, 100000], logRetentionDays: [1, 365], alertFailureRate: [0, 100],
+    alertSchemaErrorRate: [0, 100], alertRetryRate: [0, 100], alertMinCalls: [1, 10000],
+    canaryFailureRate: [0, 100], canarySchemaErrorRate: [0, 100], canaryMinCalls: [1, 10000]
   };
   for (const [key, [min, max]] of Object.entries(numeric)) {
     const value = Number(next[key]);
@@ -623,6 +781,9 @@ function saveSettings(patch, actor) {
   }
   next.analyzeEnabled = next.analyzeEnabled !== false;
   next.alertNotificationsEnabled = next.alertNotificationsEnabled === true || next.alertNotificationsEnabled === 'true';
+  next.canaryAutoStop = next.canaryAutoStop !== false && next.canaryAutoStop !== 'false';
+  next.releaseFreeze = next.releaseFreeze === true || next.releaseFreeze === 'true';
+  next.releaseFreezeReason = clip(next.releaseFreezeReason, 200).trim();
   next.model = clip(next.model, 60) || DEFAULT_SETTINGS.model;
   writeJson(FILES.settings, next);
   const versions = readJson(FILES.versions, []);
@@ -636,8 +797,33 @@ function saveSettings(patch, actor) {
 
 /* ---------- 运行日志 ---------- */
 
+const LOG_FIELDS = new Set(['id', 'at', 'model', 'ok', 'code', 'error', 'latencyMs', 'attempts', 'usage', 'cost', 'modelReturned', 'role', 'prompts', 'promptVersions', 'riskHits', 'truncated', 'dropped', 'inputChars', 'validationErrors']);
+
 function appendLog(entry) {
-  const safeEntry = { ...entry };
+  const safeEntry = {
+    at: entry?.at || new Date().toISOString(),
+    model: entry?.model || null,
+    ok: !!entry?.ok,
+    code: entry?.code || null,
+    error: entry?.error || null,
+    latencyMs: Number(entry?.latencyMs || 0),
+    attempts: Number(entry?.attempts || 1),
+    usage: entry?.usage && typeof entry.usage === 'object' ? {
+      prompt_tokens: Number(entry.usage.prompt_tokens || 0),
+      completion_tokens: Number(entry.usage.completion_tokens || 0),
+      total_tokens: Number(entry.usage.total_tokens || 0)
+    } : null,
+    cost: Number(entry?.cost || 0),
+    modelReturned: entry?.modelReturned || null,
+    role: entry?.role || null,
+    prompts: Array.isArray(entry?.prompts) ? entry.prompts.slice(0, 30) : [],
+    promptVersions: Array.isArray(entry?.promptVersions) ? entry.promptVersions : [],
+    riskHits: Array.isArray(entry?.riskHits) ? entry.riskHits.slice(0, 20) : [],
+    truncated: Array.isArray(entry?.truncated) ? entry.truncated.slice(0, 30) : [],
+    dropped: Array.isArray(entry?.dropped) ? entry.dropped.slice(0, 30) : [],
+    inputChars: Number(entry?.inputChars || 0),
+    validationErrors: Array.isArray(entry?.validationErrors) ? entry.validationErrors : []
+  };
   safeEntry.promptVersions = Array.isArray(safeEntry.promptVersions)
     ? safeEntry.promptVersions.map(item => ({ name: String(item?.name || '').slice(0, 80), version: String(item?.version || 'unknown').slice(0, 40) })).filter(item => item.name).slice(0, 30)
     : [];
@@ -645,7 +831,7 @@ function appendLog(entry) {
     ? safeEntry.validationErrors.map(item => String(item).replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 80)).filter(Boolean).slice(0, 12)
     : [];
   if (!safeEntry.ok) safeEntry.error = ERROR_LABEL[safeEntry.code] || '调用失败';
-  const row = { id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`, ...safeEntry };
+  const row = { ...safeEntry, id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}` };
   const line = JSON.stringify(row);
   try {
     fs.appendFileSync(FILES.logs, line + '\n', 'utf8');
@@ -664,6 +850,8 @@ function readLogs({ limit = 200, days = 0, ok, code, model, prompt, role, minLat
     if (!line.trim()) continue;
     try {
       const entry = JSON.parse(line);
+      for (const key of Object.keys(entry)) if (!LOG_FIELDS.has(key)) delete entry[key];
+      if (!entry.ok) entry.error = ERROR_LABEL[entry.code] || '调用失败';
       if (since && new Date(entry.at).getTime() < since) continue;
       if (ok !== undefined && !!entry.ok !== ok) continue;
       if (code && entry.code !== code) continue;
@@ -680,6 +868,67 @@ function readLogs({ limit = 200, days = 0, ok, code, model, prompt, role, minLat
 
 function findLog(id) {
   return readLogs({ limit: Number.MAX_SAFE_INTEGER }).rows.find(item => item.id === id) || null;
+}
+
+// 任务中心只从运行日志派生安全元数据；输入正文永不进入任务列表。
+function listTasks({ page = 1, limit = 50, status, role, days = 0 } = {}) {
+  const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 200);
+  const safePage = Math.max(Number(page) || 1, 1);
+  const logs = readLogs({ limit: Number.MAX_SAFE_INTEGER, days, role }).rows;
+  const retryableCodes = new Set(['RATE_LIMIT', 'UPSTREAM_TIMEOUT', 'MODEL_UNAVAILABLE', 'EMPTY_MODEL_OUTPUT', 'INVALID_MODEL_JSON', 'INVALID_MODEL_SCHEMA', 'ANALYZE_FAILED']);
+  const tasks = logs.map(log => ({
+    id: String(log.id || ''),
+    at: log.at || null,
+    status: log.ok ? 'succeeded' : 'failed',
+    retryable: !log.ok && retryableCodes.has(log.code),
+    code: log.code || null,
+    errorLabel: log.code ? (ERROR_LABEL[log.code] || '调用失败') : null,
+    role: log.role || null,
+    model: log.model || log.modelReturned || null,
+    promptVersions: Array.isArray(log.promptVersions) ? log.promptVersions.slice(0, 30) : [],
+    latencyMs: Number(log.latencyMs || 0),
+    attempts: Number(log.attempts || 1),
+    totalTokens: Number(log.usage?.total_tokens || 0),
+    cost: Number(log.cost || 0),
+    inputChars: Number(log.inputChars || 0)
+  })).filter(task => !status || task.status === status);
+  const total = tasks.length;
+  const start = (safePage - 1) * safeLimit;
+  const items = tasks.slice(start, start + safeLimit);
+  const summary = { total, succeeded: tasks.filter(task => task.status === 'succeeded').length, failed: tasks.filter(task => task.status === 'failed').length, retryable: tasks.filter(task => task.retryable).length, cost: Number(tasks.reduce((sum, task) => sum + task.cost, 0).toFixed(6)) };
+  return { items, total, page: safePage, limit: safeLimit, pages: Math.max(Math.ceil(total / safeLimit), 1), summary };
+}
+
+// 日志详情只允许展示可运营的元数据，避免把输入、Prompt 或上游原始错误带回后台。
+function safeLogDetail(entry) {
+  if (!entry) return null;
+  const usage = entry.usage && typeof entry.usage === 'object' ? {
+    prompt_tokens: Number(entry.usage.prompt_tokens || 0),
+    completion_tokens: Number(entry.usage.completion_tokens || 0),
+    total_tokens: Number(entry.usage.total_tokens || 0)
+  } : null;
+  return {
+    id: String(entry.id || ''),
+    at: entry.at || null,
+    ok: !!entry.ok,
+    status: entry.ok ? 'success' : 'failed',
+    code: entry.code || null,
+    errorLabel: entry.code ? (ERROR_LABEL[entry.code] || '调用失败') : null,
+    model: entry.model || null,
+    modelReturned: entry.modelReturned || null,
+    role: entry.role || null,
+    prompts: Array.isArray(entry.prompts) ? entry.prompts.slice(0, 30) : [],
+    promptVersions: Array.isArray(entry.promptVersions) ? entry.promptVersions.slice(0, 30) : [],
+    latencyMs: Number(entry.latencyMs || 0),
+    attempts: Number(entry.attempts || 1),
+    usage,
+    cost: Number(entry.cost || 0),
+    inputChars: Number(entry.inputChars || 0),
+    truncatedCount: Array.isArray(entry.truncated) ? entry.truncated.length : 0,
+    droppedCount: Array.isArray(entry.dropped) ? entry.dropped.length : 0,
+    schemaErrors: Array.isArray(entry.validationErrors) ? entry.validationErrors.slice(0, 12) : [],
+    riskHits: Array.isArray(entry.riskHits) ? entry.riskHits.slice(0, 20) : []
+  };
 }
 
 function pruneLogs() {
@@ -999,6 +1248,63 @@ function logStats(days = 7, filters = {}) {
   };
 }
 
+function costBudgetStatus() {
+  const settings = getSettings();
+  const now = Date.now();
+  const rows = readLogs({ limit: Number.MAX_SAFE_INTEGER, days: 1 }).rows;
+  const spent = rows.reduce((sum, row) => sum + costOf(row.usage, settings), 0);
+  const budget = Number(settings.dailyCostBudget || 0);
+  const exhausted = budget > 0 && spent >= budget;
+  return { enabled: budget > 0, budget: Number(budget.toFixed(4)), spent: Number(spent.toFixed(4)), remaining: budget > 0 ? Number(Math.max(0, budget - spent).toFixed(4)) : null, exceeded: exhausted, exhausted, period: { from: new Date(now - 86400000).toISOString(), to: new Date(now).toISOString() } };
+}
+
+function releaseComparison(id, version, beforeDays = 7, afterDays = 7) {
+  const prompt = getPrompt(id);
+  if (!prompt) return null;
+  const safeBefore = Math.min(Math.max(Number(beforeDays) || 7, 1), 90);
+  const safeAfter = Math.min(Math.max(Number(afterDays) || 7, 1), 90);
+  const versions = readJson(FILES.versions, [])
+    .filter(item => String(item.promptId) === String(id) && item.snapshot && item.version === version && ['seed', 'publish', 'production_rollback'].includes(item.action))
+    .sort((a, b) => new Date(a.at) - new Date(b.at));
+  const release = versions[versions.length - 1];
+  if (!release) return { status: 'not_found', prompt: { id: prompt.id, name: prompt.name }, version };
+  const boundary = new Date(release.at).getTime();
+  const all = readLogs({ limit: Number.MAX_SAFE_INTEGER }).rows;
+  const matches = row => (row.promptVersions || []).some(item => item.name === prompt.name && item.version === version);
+  const inWindow = (row, start, end) => { const at = new Date(row.at).getTime(); return matches(row) && at >= start && at < end; };
+  const settings = getSettings();
+  const aggregate = (rows) => {
+    const failed = rows.filter(row => !row.ok).length;
+    const schemaErrors = rows.filter(row => (row.validationErrors || []).length > 0).length;
+    const retries = rows.filter(row => Number(row.attempts || 1) > 1).length;
+    const successfulLatencies = rows.filter(row => row.ok).map(row => Number(row.latencyMs || 0)).sort((a, b) => a - b);
+    const totalTokens = rows.reduce((sum, row) => sum + Number(row.usage?.total_tokens || 0), 0);
+    const inputChars = rows.reduce((sum, row) => sum + Number(row.inputChars || 0), 0);
+    const cost = rows.reduce((sum, row) => sum + costOf(row.usage, settings) / Math.max((row.promptVersions || []).length, 1), 0);
+    const feedback = readJson(FILES.feedback, []).filter(item => rows.some(row => row.id === item.logId));
+    const good = feedback.filter(item => item.rating === 'good').length;
+    const bad = feedback.filter(item => item.rating === 'bad').length;
+    return {
+      calls: rows.length, failed, successRate: rows.length ? Number(((rows.length - failed) / rows.length * 100).toFixed(1)) : null,
+      failureRate: rows.length ? Number((failed / rows.length * 100).toFixed(1)) : null,
+      schemaErrors, schemaErrorRate: rows.length ? Number((schemaErrors / rows.length * 100).toFixed(1)) : null,
+      retries, retryRate: rows.length ? Number((retries / rows.length * 100).toFixed(1)) : null,
+      p50Latency: percentile(successfulLatencies, 0.5) || null, p95Latency: percentile(successfulLatencies, 0.95) || null,
+      avgInputChars: rows.length ? Math.round(inputChars / rows.length) : null,
+      tokens: totalTokens, cost: Number(cost.toFixed(4)), feedback: { total: feedback.length, good, bad, positiveRate: feedback.length ? Number((good / feedback.length * 100).toFixed(1)) : null }
+    };
+  };
+  const before = aggregate(all.filter(row => inWindow(row, boundary - safeBefore * 86400000, boundary)));
+  const after = aggregate(all.filter(row => inWindow(row, boundary, boundary + safeAfter * 86400000)));
+  return {
+    status: before.calls && after.calls ? 'ready' : 'insufficient_data',
+    prompt: { id: prompt.id, name: prompt.name }, version,
+    release: { at: release.at, actor: release.actor || null, action: release.action },
+    windows: { beforeDays: safeBefore, afterDays: safeAfter, before: { from: new Date(boundary - safeBefore * 86400000).toISOString(), to: release.at }, after: { from: release.at, to: new Date(boundary + safeAfter * 86400000).toISOString() } },
+    before, after
+  };
+}
+
 /* ---------- 质量反馈 ---------- */
 
 const FEEDBACK_STATUSES = new Set(['open', 'reviewing', 'resolved', 'dismissed']);
@@ -1060,6 +1366,37 @@ function updateFeedback(id, input, actor) {
   return item;
 }
 
+function linkFeedback(id, input, actor) {
+  const all = readJson(FILES.feedback, []);
+  const item = all.find(row => row.id === id);
+  if (!item) return null;
+  const promptId = String(input?.promptId || '').trim();
+  const testCaseId = String(input?.testCaseId || '').trim();
+  const prompt = promptId ? getPrompt(promptId) : null;
+  if (!prompt) throw Object.assign(new Error('关联的 Prompt 不存在'), { statusCode: 400, code: 'FEEDBACK_PROMPT_NOT_FOUND' });
+  const testCase = testCaseId ? readJson(FILES.testCases, []).find(row => String(row.id) === testCaseId) : null;
+  if (testCaseId && !testCase) throw Object.assign(new Error('关联的测试案例不存在'), { statusCode: 400, code: 'FEEDBACK_TEST_CASE_NOT_FOUND' });
+  if (testCase?.promptId && String(testCase.promptId) !== String(prompt.id)) {
+    throw Object.assign(new Error('测试案例不属于所选 Prompt'), { statusCode: 400, code: 'FEEDBACK_CASE_PROMPT_MISMATCH' });
+  }
+  item.loop = {
+    promptId: prompt.id,
+    promptName: clip(prompt.name, 80),
+    sourceVersion: prompt.version || null,
+    publishedVersion: prompt.publishedVersion || null,
+    testCaseId: testCase ? testCase.id : null,
+    testCaseName: testCase ? clip(testCase.name, 100) : null,
+    note: clip(input?.note, 500).trim(),
+    status: input?.status === 'resolved' ? 'resolved' : 'planned',
+    linkedAt: new Date().toISOString(),
+    linkedBy: actor
+  };
+  item.updatedAt = new Date().toISOString(); item.updatedBy = actor;
+  writeJson(FILES.feedback, all);
+  pushAuditEvent('feedback_update', actor, `质量反馈：${item.id}`, `建立闭环：${prompt.name}${testCase ? `，测试案例 ${testCase.name}` : ''}`);
+  return item;
+}
+
 function feedbackStats() {
   const items = readJson(FILES.feedback, []);
   const byTag = {};
@@ -1067,6 +1404,136 @@ function feedbackStats() {
   const good = items.filter(item => item.rating === 'good').length;
   const bad = items.filter(item => item.rating === 'bad').length;
   return { total: items.length, good, bad, positiveRate: items.length ? Number((good / items.length * 100).toFixed(1)) : 0, open: items.filter(item => ['open', 'reviewing'].includes(item.status)).length, resolved: items.filter(item => item.status === 'resolved').length, byTag: Object.entries(byTag).map(([tag, count]) => ({ tag, count })).sort((a, b) => b.count - a.count) };
+}
+
+/* ---------- Prompt 质量分析 ---------- */
+
+function qualityStats(days = 7) {
+  const safeDays = Math.min(Math.max(Number(days) || 7, 1), 90);
+  const since = Date.now() - safeDays * 86400000;
+  const logs = readLogs({ limit: Number.MAX_SAFE_INTEGER, days: safeDays }).rows;
+  const feedback = readJson(FILES.feedback, []).filter(item => new Date(item.updatedAt || item.createdAt || 0).getTime() >= since);
+  const feedbackByLog = new Map(feedback.map(item => [String(item.logId), item]));
+  const buckets = new Map();
+  const roles = new Map();
+  const add = (map, key, log, feedbackItem) => {
+    if (!map.has(key)) map.set(key, { key, calls: 0, failed: 0, schemaErrors: 0, retries: 0, latency: 0, tokens: 0, cost: 0, feedback: 0, good: 0, bad: 0 });
+    const row = map.get(key);
+    row.calls += 1;
+    row.failed += log.ok ? 0 : 1;
+    row.schemaErrors += Array.isArray(log.validationErrors) && log.validationErrors.length ? 1 : 0;
+    row.retries += Number(log.attempts || 1) > 1 ? 1 : 0;
+    row.latency += Number(log.latencyMs || 0);
+    row.tokens += Number(log.usage?.total_tokens || 0);
+    row.cost += Number(log.cost || 0);
+    if (feedbackItem) {
+      row.feedback += 1;
+      row.good += feedbackItem.rating === 'good' ? 1 : 0;
+      row.bad += feedbackItem.rating === 'bad' ? 1 : 0;
+    }
+  };
+  for (const log of logs) {
+    const feedbackItem = feedbackByLog.get(String(log.id));
+    const versions = Array.isArray(log.promptVersions) && log.promptVersions.length
+      ? log.promptVersions
+      : (log.prompts || []).map(name => ({ name, version: '-' }));
+    for (const item of versions) add(buckets, `${item.name || '-'}@${item.version || '-'}`, log, feedbackItem);
+    add(roles, String(log.role || '未填写'), log, feedbackItem);
+  }
+  const format = row => ({
+    prompt: row.key.includes('@') ? row.key.slice(0, row.key.lastIndexOf('@')) : row.key,
+    version: row.key.includes('@') ? row.key.slice(row.key.lastIndexOf('@') + 1) : '-',
+    calls: row.calls, failed: row.failed,
+    successRate: row.calls ? Number(((row.calls - row.failed) / row.calls * 100).toFixed(1)) : 0,
+    failureRate: row.calls ? Number((row.failed / row.calls * 100).toFixed(1)) : 0,
+    schemaErrorRate: row.calls ? Number((row.schemaErrors / row.calls * 100).toFixed(1)) : 0,
+    retryRate: row.calls ? Number((row.retries / row.calls * 100).toFixed(1)) : 0,
+    avgLatency: row.calls ? Math.round(row.latency / row.calls) : 0,
+    tokens: row.tokens, cost: Number(row.cost.toFixed(4)),
+    feedback: row.feedback, good: row.good, bad: row.bad,
+    positiveRate: row.feedback ? Number((row.good / row.feedback * 100).toFixed(1)) : null
+  });
+  const all = { calls: 0, failed: 0, schemaErrors: 0, retries: 0, latency: 0, tokens: 0, cost: 0, feedback: 0, good: 0, bad: 0 };
+  for (const log of logs) {
+    all.calls += 1; all.failed += log.ok ? 0 : 1;
+    all.schemaErrors += Array.isArray(log.validationErrors) && log.validationErrors.length ? 1 : 0;
+    all.retries += Number(log.attempts || 1) > 1 ? 1 : 0;
+    all.latency += Number(log.latencyMs || 0); all.tokens += Number(log.usage?.total_tokens || 0); all.cost += Number(log.cost || 0);
+    const item = feedbackByLog.get(String(log.id));
+    if (item) { all.feedback += 1; all.good += item.rating === 'good' ? 1 : 0; all.bad += item.rating === 'bad' ? 1 : 0; }
+  }
+  const overall = format({ key: '全部', ...all });
+  return {
+    days: safeDays, generatedAt: new Date().toISOString(), overall,
+    byPrompt: [...buckets.values()].map(format).sort((a, b) => b.calls - a.calls || a.prompt.localeCompare(b.prompt)).slice(0, 100),
+    byRole: [...roles.values()].map(row => ({ role: row.key, ...format(row) })).sort((a, b) => b.calls - a.calls).slice(0, 50)
+  };
+}
+
+/* ---------- Prompt A/B 实验中心 ---------- */
+
+function experimentGroup(rows, promptName, version, feedbackByLog, settings) {
+  const matched = rows.filter(row => (row.promptVersions || []).some(item => String(item.name) === String(promptName) && String(item.version) === String(version)));
+  const successfulLatencies = matched.filter(row => row.ok).map(row => Number(row.latencyMs || 0)).sort((a, b) => a - b);
+  const failed = matched.filter(row => !row.ok).length;
+  const schemaErrors = matched.filter(row => (row.validationErrors || []).length > 0).length;
+  const retries = matched.filter(row => Number(row.attempts || 1) > 1).length;
+  let feedback = 0; let good = 0; let bad = 0;
+  for (const row of matched) {
+    const item = feedbackByLog.get(String(row.id));
+    if (!item) continue;
+    feedback += 1; good += item.rating === 'good' ? 1 : 0; bad += item.rating === 'bad' ? 1 : 0;
+  }
+  const callCost = matched.reduce((sum, row) => {
+    const count = Math.max((row.promptVersions || []).length, 1);
+    return sum + costOf(row.usage, settings) / count;
+  }, 0);
+  const calls = matched.length;
+  return {
+    calls, failed,
+    successRate: calls ? Number(((calls - failed) / calls * 100).toFixed(1)) : 0,
+    failureRate: calls ? Number((failed / calls * 100).toFixed(1)) : 0,
+    schemaErrors,
+    schemaErrorRate: calls ? Number((schemaErrors / calls * 100).toFixed(1)) : 0,
+    retries,
+    retryRate: calls ? Number((retries / calls * 100).toFixed(1)) : 0,
+    p50Latency: percentile(successfulLatencies, 0.5),
+    p95Latency: percentile(successfulLatencies, 0.95),
+    tokens: matched.reduce((sum, row) => sum + Number(row.usage?.total_tokens || 0), 0),
+    cost: Number(callCost.toFixed(4)),
+    feedback: { total: feedback, good, bad, positiveRate: feedback ? Number((good / feedback * 100).toFixed(1)) : null }
+  };
+}
+
+function experiments(days = 7) {
+  const safeDays = Math.min(Math.max(Number(days) || 7, 1), 90);
+  const rows = readLogs({ limit: Number.MAX_SAFE_INTEGER, days: safeDays }).rows;
+  const since = Date.now() - safeDays * 86400000;
+  const feedbackByLog = new Map(readJson(FILES.feedback, [])
+    .filter(item => new Date(item.updatedAt || item.createdAt || 0).getTime() >= since)
+    .map(item => [String(item.logId), item]));
+  const settings = getSettings();
+  const items = getPrompts().filter(prompt => prompt.canary).map(prompt => {
+    const canary = prompt.canary;
+    const sourceVersion = canary.sourceVersion || prompt.publishedVersion || '-';
+    const control = experimentGroup(rows, prompt.name, sourceVersion, feedbackByLog, settings);
+    const candidate = experimentGroup(rows, prompt.name, canary.version, feedbackByLog, settings);
+    const minCalls = 10;
+    const sufficientData = control.calls >= minCalls && candidate.calls >= minCalls;
+    let status = 'insufficient_data';
+    if (sufficientData) {
+      const candidateBetter = candidate.failureRate <= control.failureRate && candidate.schemaErrorRate <= control.schemaErrorRate && (candidate.failureRate < control.failureRate || candidate.schemaErrorRate < control.schemaErrorRate);
+      const candidateWorse = candidate.failureRate >= control.failureRate && candidate.schemaErrorRate >= control.schemaErrorRate && (candidate.failureRate > control.failureRate || candidate.schemaErrorRate > control.schemaErrorRate);
+      status = candidateBetter ? 'candidate_better' : candidateWorse ? 'candidate_worse' : 'inconclusive';
+    }
+    return {
+      promptId: prompt.id, promptName: prompt.name,
+      sourceVersion, candidateVersion: canary.version,
+      trafficPercent: Number(canary.trafficPercent || 0), startedAt: canary.startedAt || null, startedBy: canary.startedBy || null,
+      minCalls, sufficientData, status, control, candidate
+    };
+  });
+  return { days: safeDays, generatedAt: new Date().toISOString(), items };
 }
 
 /* ---------- 风险与规则 ---------- */
@@ -1231,6 +1698,26 @@ function listRegressions(promptId, limit = 30) {
   return rows.sort((a, b) => new Date(b.at) - new Date(a.at)).slice(0, Math.min(Math.max(Number(limit) || 30, 1), 100));
 }
 
+function regressionCenter() {
+  return {
+    generatedAt: new Date().toISOString(),
+    items: getPrompts().map(prompt => {
+      const cases = listTestCases(prompt.id);
+      const latest = listRegressions(prompt.id, 1)[0] || null;
+      const currentSuite = regressionSuiteKey(prompt.id);
+      let status = 'no_cases';
+      if (cases.length && !latest) status = 'not_run';
+      else if (cases.length && latest) status = latest.passed && Number(latest.promptRevision) === Number(prompt.revision) && latest.suiteKey === currentSuite ? 'passed' : (latest.passed ? 'stale' : 'failed');
+      return {
+        promptId: prompt.id, promptName: prompt.name, step: prompt.step || null,
+        releaseStatus: prompt.releaseStatus, version: prompt.version, publishedVersion: prompt.publishedVersion || null,
+        caseCount: cases.length, status,
+        latest: latest ? { id: latest.id, at: latest.at, promptVersion: latest.promptVersion, promptRevision: latest.promptRevision, passed: !!latest.passed, total: latest.total, failed: latest.failed, actor: latest.actor || null } : null
+      };
+    })
+  };
+}
+
 function assertRegressionGate(prompt) {
   const cases = listTestCases(prompt.id);
   if (!cases.length) return;
@@ -1243,6 +1730,46 @@ function assertRegressionGate(prompt) {
   }
 }
 
+function releaseChecklist(prompt) {
+  if (!prompt) return null;
+  const cases = listTestCases(prompt.id);
+  const latest = listRegressions(prompt.id, 1)[0] || null;
+  const suiteKey = regressionSuiteKey(prompt.id);
+  let variablesPassed = true;
+  let variableDetail = '无变量';
+  try {
+    // 老数据可能没有单独保存 variables，始终以当前内容重新校验，避免把旧 Prompt 误判为不可发布。
+    const variables = Array.isArray(prompt.variables)
+      ? prompt.variables
+      : validatePromptContent(prompt.content);
+    variableDetail = variables.length ? variables.join('、') : '无变量';
+  } catch (error) {
+    variablesPassed = false;
+    variableDetail = error.message;
+  }
+  const regressionReady = !cases.length || !!(latest && latest.passed
+    && Number(latest.promptRevision) === Number(prompt.revision)
+    && latest.suiteKey === suiteKey);
+  const checks = [
+    { id: 'name', label: 'Prompt 名称已填写', passed: !!String(prompt.name || '').trim(), blocking: true, detail: String(prompt.name || '').trim() ? '已填写' : '名称不能为空' },
+    { id: 'content', label: 'Prompt 内容非空', passed: !!String(prompt.content || '').trim(), blocking: true, detail: String(prompt.content || '').trim() ? `${String(prompt.content).length} 字` : '内容不能为空' },
+    { id: 'variables', label: '变量校验通过', passed: variablesPassed, blocking: true, detail: variableDetail },
+    { id: 'regression', label: '最新回归测试通过', passed: regressionReady, blocking: cases.length > 0, detail: !cases.length ? '未配置回归案例（警告）' : regressionReady ? `通过 ${latest.total || 0} 个案例` : '回归结果过期、失败或未运行' },
+    { id: 'canary', label: '没有冲突的进行中灰度', passed: !prompt.canary, blocking: true, detail: prompt.canary ? `灰度 ${prompt.canary.version} 仍在进行` : '无进行中灰度' }
+  ];
+  return { promptId: prompt.id, version: prompt.version, releaseStatus: prompt.releaseStatus, ready: checks.filter(item => item.blocking).every(item => item.passed), checks };
+}
+
+function assertReleaseChecklist(prompt) {
+  const checklist = releaseChecklist(prompt);
+  if (!checklist.ready) {
+    const regression = checklist.checks.find(item => item.id === 'regression');
+    const error = Object.assign(new Error('发布检查清单未通过，请先处理阻断项'), { statusCode: 409, code: regression && !regression.passed ? 'REGRESSION_GATE_FAILED' : 'RELEASE_CHECKLIST_FAILED' });
+    error.checklist = checklist;
+    throw error;
+  }
+}
+
 /* ---------- 供分析链路使用 ---------- */
 
 /**
@@ -1251,10 +1778,19 @@ function assertRegressionGate(prompt) {
  */
 function buildPromptConfig(settingsOverride, variables = {}) {
   const settings = { ...getSettings(), ...(settingsOverride || {}) };
+  evaluateCanaries();
+  const requestKey = [variables.role, variables.jd, variables.resume, variables.company].map(value => String(value || '')).join('|');
   const enabled = getPrompts()
     .filter(p => p.publishedSnapshot && p.publishedSnapshot.enabled && String(p.publishedSnapshot.content || '').trim())
-    .map(p => ({ ...p, ...p.publishedSnapshot, version: p.publishedVersion || p.version }));
-  return assemblePromptConfig(enabled, settings, variables);
+    .map(p => {
+      const canary = p.canary;
+      const digest = canary ? crypto.createHash('sha256').update(`${p.id}|${requestKey}`).digest().readUInt32BE(0) % 100 : 100;
+      const useCanary = !!canary && digest < Number(canary.trafficPercent || 0);
+      const snapshot = useCanary ? canary.snapshot : p.publishedSnapshot;
+      return { ...p, ...snapshot, version: useCanary ? canary.version : (p.publishedVersion || p.version), canary: useCanary };
+    });
+  const assembled = assemblePromptConfig(enabled, settings, variables);
+  return { ...assembled, canary: assembled.config.filter(item => item.canary).map(item => ({ name: item.name, version: item.version })) };
 }
 
 function replacePromptVariables(content, variables) {
@@ -1276,7 +1812,8 @@ function assemblePromptConfig(selected, settings, variables = {}) {
       stepKey: String(p.stepKey || 'extension').slice(0, 40),
       name: String(p.name || '自定义 Prompt').slice(0, 80),
       version: String(p.version || 'unknown').slice(0, 40),
-      content: content.slice(0, settings.promptMaxChars)
+      content: content.slice(0, settings.promptMaxChars),
+      ...(p.canary ? { canary: true } : {})
     };
   });
 
@@ -1326,6 +1863,28 @@ function overview() {
   };
 }
 
+function systemHealth() {
+  const checks = [];
+  const add = (id, label, status, detail) => checks.push({ id, label, status, detail });
+  const files = Object.entries(FILES);
+  const missing = files.filter(([, file]) => !fs.existsSync(file)).map(([name]) => name);
+  add('data_files', '运行数据文件', missing.length ? 'warn' : 'ok', missing.length ? `缺少 ${missing.join('、')}（首次启动会自动创建）` : `${files.length} 个数据文件可用`);
+  try { fs.accessSync(DATA_DIR, fs.constants.R_OK | fs.constants.W_OK); add('data_dir', '数据目录读写', 'ok', '服务进程可读写 data 目录'); }
+  catch { add('data_dir', '数据目录读写', 'fail', '服务进程无法读写 data 目录'); }
+  const prompts = getPrompts();
+  const enabledProduction = prompts.filter(item => item.publishedSnapshot?.enabled && String(item.publishedSnapshot.content || '').trim()).length;
+  add('production_prompts', '生产 Prompt', enabledProduction ? 'ok' : 'fail', enabledProduction ? `${enabledProduction} 个已启用` : '没有可用的已发布 Prompt');
+  const provider = String(process.env.AI_PROVIDER || 'deepseek').toLowerCase();
+  const keyConfigured = provider === 'openai' ? !!String(process.env.OPENAI_API_KEY || '').trim() : !!String(process.env.DEEPSEEK_API_KEY || '').trim();
+  const mockEnabled = process.env.NODE_ENV === 'test' && process.env.PROMPT_TEST_MOCK === 'true';
+  add('model_provider', '模型服务配置', keyConfigured || mockEnabled ? 'ok' : 'warn', mockEnabled ? '当前使用测试 Mock' : keyConfigured ? `${provider} 凭据已配置（不显示密钥）` : `${provider} 凭据未配置`);
+  const authConfigured = !!(process.env.ADMIN_PASSWORD || process.env.ADMIN_USERS_JSON || (process.env.ADMIN_DEV_AUTO_CREDENTIALS === 'true' && process.env.NODE_ENV !== 'production'));
+  add('admin_auth', '后台鉴权配置', authConfigured ? 'ok' : 'fail', authConfigured ? '已配置账号来源' : '未配置后台账号');
+  const failed = checks.filter(item => item.status === 'fail').length;
+  const warnings = checks.filter(item => item.status === 'warn').length;
+  return { status: failed ? 'fail' : warnings ? 'warn' : 'ok', generatedAt: new Date().toISOString(), checks };
+}
+
 function dependencyView() {
   const prompts = getPrompts();
   const rules = listRules().filter(rule => rule.enabled);
@@ -1352,14 +1911,16 @@ module.exports = {
   removePrompt, rollbackPrompt, submitPromptReview, rejectPromptReview, publishPrompt, rollbackProduction,
   listVersions, getVersion, listChanges, changesInLastDays,
   pushAuditEvent,
-  getSettings, saveSettings, appendLog, readLogs, pruneLogs, logStats, buildPromptConfig,
+  getSettings, saveSettings, appendLog, readLogs, listTasks, pruneLogs, logStats, buildPromptConfig,
   listTestCases, createTestCase, removeTestCase, appendPromptTest, listPromptTests, buildPromptConfigForTest,
-  regressionSuiteKey, appendRegression, listRegressions,
-  findLog, listFeedback, saveFeedback, updateFeedback, feedbackStats,
+  regressionSuiteKey, appendRegression, listRegressions, regressionCenter,
+  findLog, safeLogDetail, listFeedback, saveFeedback, updateFeedback, linkFeedback, feedbackStats, releaseComparison, qualityStats, experiments,
   listRules, createRule, updateRule, removeRule, scanRisk,
   listTemplates, updateTemplate, archiveTemplate, listTemplateVersions, rollbackTemplate, createPromptFromTemplate, batchPromptAction,
   dependencyView,
   validatePromptContent, replacePromptVariables, PROMPT_VARIABLES,
-  overview, costOf, bumpVersion, listAlertHistory, acknowledgeAlert,
+  overview, systemHealth, costBudgetStatus, costOf, bumpVersion, listAlertHistory, acknowledgeAlert,
   alertNotificationStatus, listAlertNotifications, testAlertNotification
+  , startCanary, stopCanary, promoteCanary, setCanaryTraffic, canaryView, canaryMetrics,
+  releaseChecklist
 };
