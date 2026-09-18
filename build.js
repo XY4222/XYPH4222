@@ -4,17 +4,20 @@ const os = require('os');
 const { SYSTEM_PROMPT } = require('./deepseek');
 const { execFileSync } = require('child_process');
 const store = require('./store');
+const edgeAdminRuntime = fs.readFileSync(path.join(__dirname, 'edge-admin-runtime.js'), 'utf8');
 
 const out = path.join(__dirname, 'dist');
 fs.rmSync(out, { recursive: true, force: true });
 fs.mkdirSync(path.join(out, 'server'), { recursive: true });
 fs.mkdirSync(path.join(out, '.openai'), { recursive: true });
+fs.mkdirSync(path.join(out, '.openai', 'drizzle'), { recursive: true });
 
 const ASSETS = ['index.html', 'styles.css', 'app.js', 'admin.html', 'admin.js'];
 for (const file of ASSETS) {
   fs.copyFileSync(path.join(__dirname, file), path.join(out, file));
 }
 fs.copyFileSync(path.join(__dirname, '.openai', 'hosting.json'), path.join(out, '.openai', 'hosting.json'));
+fs.copyFileSync(path.join(__dirname, 'drizzle', '0000_online_admin.sql'), path.join(out, '.openai', 'drizzle', '0000_online_admin.sql'));
 
 /**
  * 把任意 JS 值安全嵌进下面的模板字符串。
@@ -68,6 +71,7 @@ const files = ${embed(files)};
 const SYSTEM_PROMPT = ${embed(SYSTEM_PROMPT)};
 const PROMPT_CONFIG = ${embed(baked.config)};
 const PROMPT_META = ${embed(meta)};
+${edgeAdminRuntime}
 const rateBuckets = new Map();
 let analyzeInFlight = 0;
 
@@ -162,6 +166,7 @@ async function handleAnalyze(request, env) {
   const retryAfter = admitAnalyze(request, env);
   if (retryAfter) return json({ error: '分析请求较多，请稍后重试', code: 'RATE_LIMIT', degradation: degradationFor('RATE_LIMIT', retryAfter) }, 429, { 'retry-after': String(retryAfter) });
   const runId = 'edge-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);
+  const started = Date.now();
   try {
   if (!env.DEEPSEEK_API_KEY) {
     traceFailure(runId, 'MISSING_API_KEY', 0);
@@ -180,9 +185,14 @@ async function handleAnalyze(request, env) {
     return json({ error: '缺少目标岗位、JD 或原始简历', code: 'BAD_REQUEST', attempts: 0, runId, degradation: degradationFor('BAD_REQUEST') }, 400);
   }
 
-  const model = env.DEEPSEEK_MODEL || PROMPT_META.settings.model || 'deepseek-v4-flash';
+  const runtimeState = env.DB ? await edgeState(env) : null;
+  const runtimePromptConfig = runtimeState
+    ? runtimeState.prompts.filter(p => p.enabled && p.releaseStatus === 'published').sort((a, b) => (a.step ?? 99) - (b.step ?? 99)).map(p => ({ step: p.step, stepKey: p.stepKey, name: p.name, content: p.publishedSnapshot?.content || p.content }))
+    : PROMPT_CONFIG;
+  const runtimeSettings = runtimeState?.settings || PROMPT_META.settings;
+  const model = env.DEEPSEEK_MODEL || runtimeSettings.model || 'deepseek-v4-flash';
   const retries = Math.max(0, Math.min(5, Math.floor(Number(PROMPT_META.settings.retries) || 0)));
-  const userPrompt = buildUserPrompt(input, PROMPT_CONFIG);
+  const userPrompt = buildUserPrompt(input, runtimePromptConfig);
   let lastError;
   let attempts = 0;
 
@@ -210,6 +220,9 @@ async function handleAnalyze(request, env) {
         retryAfter: Number(response.headers.get('retry-after')) || 0
       });
       const result = parseModelJson(payload?.choices?.[0]?.message?.content);
+      const usage = payload.usage || null;
+      const cost = usage ? (Number(usage.prompt_tokens || 0) / 1000000 * Number(runtimeSettings.inputPricePerM || 0)) + (Number(usage.completion_tokens || 0) / 1000000 * Number(runtimeSettings.outputPricePerM || 0)) : 0;
+      await edgeLog(env, { id: runId, at: new Date().toISOString(), ok: true, model: payload.model || model, role: input.role, latencyMs: Date.now() - started, attempts, inputTokens: usage?.prompt_tokens || 0, outputTokens: usage?.completion_tokens || 0, cost, inputChars: String(input.jd || '').length + String(input.resume || '').length });
       return json({
         analysis: result,
         state: 'completed',
@@ -217,7 +230,7 @@ async function handleAnalyze(request, env) {
         usage: payload.usage || null,
         attempts,
         runId,
-        promptConfig: { applied: PROMPT_CONFIG.length, truncated: PROMPT_META.truncated, dropped: PROMPT_META.dropped }
+        promptConfig: { applied: runtimePromptConfig.length, truncated: PROMPT_META.truncated, dropped: PROMPT_META.dropped }
       });
     } catch (error) {
       lastError = error;
@@ -233,13 +246,15 @@ async function handleAnalyze(request, env) {
   const status = code === 'RATE_LIMIT' ? 429 : code === 'UPSTREAM_TIMEOUT' ? 504 : ['MODEL_UNAVAILABLE', 'MODEL_AUTH_ERROR'].includes(code) ? 503 : 502;
   const degradation = degradationFor(code, lastError?.retryAfter);
   traceFailure(runId, code, attempts);
+  await edgeLog(env, { id: runId, at: new Date().toISOString(), ok: false, model, role: input.role, code, latencyMs: Date.now() - started, attempts, inputChars: String(input.jd || '').length + String(input.resume || '').length });
   return json({ error: degradation.message + (attempts > 1 ? '，已自动重试' : ''), code, attempts, runId, degradation }, status);
   } finally { analyzeInFlight = Math.max(0, analyzeInFlight - 1); }
 }
 
 export default {
-  async fetch(request, env) {
-    const pathname = new URL(request.url).pathname;
+  async fetch(request, env = {}) {
+    const url = new URL(request.url);
+    const pathname = url.pathname;
 
     if (pathname === '/api/analyze') {
       if (request.method !== 'POST') return json({ error: '请求方法不支持', code: 'METHOD_NOT_ALLOWED' }, 405);
@@ -254,14 +269,24 @@ export default {
     }
 
     if (pathname === '/api/prompts/active') {
+      const runtimeState = env.DB ? await edgeState(env) : null;
+      const activePrompts = runtimeState
+        ? runtimeState.prompts.filter(p => p.enabled && p.releaseStatus === 'published').sort((a, b) => (a.step ?? 99) - (b.step ?? 99)).map(p => ({ step: p.step, stepKey: p.stepKey, name: p.name, content: p.publishedSnapshot?.content || p.content }))
+        : PROMPT_CONFIG;
       return json({
-        prompts: PROMPT_CONFIG, truncated: PROMPT_META.truncated, dropped: PROMPT_META.dropped,
-        enabledCount: PROMPT_CONFIG.length, maxChars: PROMPT_META.maxChars, readOnly: true
+        prompts: activePrompts, truncated: PROMPT_META.truncated, dropped: PROMPT_META.dropped,
+        enabledCount: activePrompts.length, maxChars: PROMPT_META.maxChars, readOnly: false
       });
     }
-    if (pathname === '/api/health') return json({ ok: true, mode: 'edge', readOnly: true });
+    if (pathname === '/api/health') return json({ ok: true, mode: 'edge', readOnly: false, persistence: env.DB ? 'd1' : 'unavailable' });
     if (pathname.startsWith('/api/')) {
-      return json({ error: '边缘部署为只读模式，管理接口不可用。请在本地运行 node server.js 使用完整后台。', code: 'READ_ONLY' }, 501);
+      try {
+        const response = await handleEdgeAdmin(request, env, url);
+        if (response) return response;
+      } catch (error) {
+        console.error(JSON.stringify({ event: 'edge_admin_failed', path: pathname, code: error.code || 'ADMIN_FAILED', message: error.message }));
+        return json({ error: error.code === 'STORAGE_UNAVAILABLE' ? '线上数据库暂不可用' : '管理操作失败', code: error.code || 'ADMIN_FAILED' }, error.statusCode || 500);
+      }
     }
 
     const asset = files[pathname] || files['/'];

@@ -15,7 +15,11 @@
     prompts: [],
     query: { q: '', status: 'all', type: 'all' },
     changes: [],
+    changesMeta: { total: 0, page: 1, pages: 1, actions: [] },
+    changeFilter: { action: '', actor: '', from: '', to: '' },
     logs: [],
+    tasks: null,
+    taskFilter: { status: '', role: '', days: 7, page: 1 },
     logStats: null,
     logDays: 7,
     logFilter: { ok: 'all', model: '', prompt: '', role: '', minLatency: 0 },
@@ -26,6 +30,14 @@
     regressionRuns: [],
     feedback: [],
     feedbackStats: null,
+    feedbackFilter: { status: '', rating: '', prompt: '' },
+    quality: null,
+    qualityDays: 7,
+    experiments: null,
+    experimentDays: 7,
+    regressionCenter: null,
+    dashboard: null,
+    systemHealth: null,
     rules: [],
     dependencies: null,
     testResult: null,
@@ -217,7 +229,7 @@
 
   /* ---------- 路由 ---------- */
 
-  const ROUTE_TITLE = { prompts: 'Prompt 总览', releases: '发布中心', tests: 'Prompt 测试台', changes: '变更记录', logs: '运行日志', feedback: '质量反馈', rules: '风险规则', dependencies: '流程依赖', settings: '项目设置' };
+  const ROUTE_TITLE = { dashboard: '运营总览', prompts: 'Prompt 总览', releases: '发布中心', tests: 'Prompt 测试台', changes: '变更记录', logs: '运行日志', tasks: '任务中心', quality: '质量分析', experiments: '实验中心', regressions: '回归中心', health: '系统健康', feedback: '质量反馈', rules: '风险规则', dependencies: '流程依赖', settings: '项目设置' };
 
   function setNav(route) {
     $('#crumb').textContent = ROUTE_TITLE[route] || route;
@@ -230,8 +242,14 @@
     render();
     // 首次进入某个页签时再拉数据，避免启动时打满请求
     try {
-      if (route === 'changes') await loadChanges();
+      if (route === 'dashboard') await loadDashboard();
+      else if (route === 'changes') await loadChanges();
       else if (route === 'logs') await loadLogs();
+      else if (route === 'tasks') await loadTasks();
+      else if (route === 'quality') await loadQuality();
+      else if (route === 'experiments') await loadExperiments();
+      else if (route === 'regressions') await loadRegressionCenter();
+      else if (route === 'health') await loadSystemHealth();
       else if (route === 'feedback') await loadFeedback();
       else if (route === 'rules') await loadRules();
       else if (route === 'dependencies') await loadDependencies();
@@ -243,11 +261,17 @@
 
   function render() {
     const page = $('#page');
-    if (state.route === 'prompts') page.innerHTML = viewPrompts();
+    if (state.route === 'dashboard') { page.innerHTML = viewDashboard(); const b = state.dashboard?.budget || {}; page.insertAdjacentHTML('afterbegin', `<section class="panel budget-summary"><div class="panel-head"><div><h2>近 24 小时成本预算</h2><p>${b.enabled ? `预算 ¥${fmtCost(b.budget)} · 已使用 ¥${fmtCost(b.spent || 0)} · 剩余 ¥${fmtCost(b.remaining || 0)}` : '预算监控未启用（每日预算设为 0）'}</p></div>${b.exceeded ? tag('已超预算', 'red') : b.enabled ? tag('预算内', 'green') : ''}</div></section>`); }
+    else if (state.route === 'prompts') page.innerHTML = viewPrompts();
     else if (state.route === 'releases') page.innerHTML = viewReleases();
     else if (state.route === 'tests') page.innerHTML = viewTests();
     else if (state.route === 'changes') page.innerHTML = viewChanges();
     else if (state.route === 'logs') page.innerHTML = viewLogs();
+    else if (state.route === 'tasks') page.innerHTML = viewTasks();
+    else if (state.route === 'quality') page.innerHTML = viewQuality();
+    else if (state.route === 'experiments') page.innerHTML = viewExperiments();
+    else if (state.route === 'regressions') page.innerHTML = viewRegressionCenter();
+    else if (state.route === 'health') page.innerHTML = viewSystemHealth();
     else if (state.route === 'feedback') page.innerHTML = viewFeedback();
     else if (state.route === 'rules') page.innerHTML = viewRules();
     else if (state.route === 'dependencies') page.innerHTML = viewDependencies();
@@ -261,13 +285,32 @@
 
   function loading(text) { return `<div class="panel"><div class="loading">${escapeHtml(text || '加载中…')}</div></div>`; }
 
+  function viewDashboard() {
+    const data = state.dashboard;
+    if (!data) return `<div class="headline"><div><h1>运营总览</h1><p>集中查看发布、运行、质量和告警状态。</p></div></div>${loading()}`;
+    const o = data.overview || {}; const q = data.quality?.overall || {}; const t = data.tasks?.summary || {}; const b = data.budget || {};
+    const alerts = (data.alerts?.items || []).filter(item => item.status !== 'recovered');
+    const alertRows = alerts.slice(0, 6).map(item => `<tr><td>${escapeHtml(item.scope || '-')}</td><td>${escapeHtml(item.metric || '-')}</td><td>${tag(item.status || 'active', item.status === 'acknowledged' ? 'blue' : 'amber')}</td><td>${item.lastRate != null ? `${item.lastRate}%` : '—'}</td></tr>`).join('');
+    return `<div class="headline"><div><h1>运营总览</h1><p>数据来自服务端接口，统计窗口：近 7 天。</p></div><button class="secondary" id="reloadDashboard">刷新</button></div><section class="stats"><div class="stat"><label>待审核 Prompt</label><strong>${fmtNumber(o.reviews || 0)}</strong><small>${o.reviews ? '需要管理员处理' : '当前无待审核'}</small></div><div class="stat"><label>失败任务</label><strong>${fmtNumber(t.failed || 0)}</strong><small class="${t.failed ? 'warn' : 'good'}">当前窗口</small></div><div class="stat"><label>近 7 天成功率</label><strong>${q.successRate == null ? '—' : `${q.successRate}%`}</strong><small>${fmtNumber(q.calls || 0)} 次调用</small></div><div class="stat"><label>活动告警</label><strong>${fmtNumber(alerts.length)}</strong><small class="${alerts.length ? 'warn' : 'good'}">${alerts.length ? '需要关注' : '运行正常'}</small></div><div class="stat"><label>流程覆盖</label><strong>${o.coverage || 0}/${o.coverageTotal || 8}</strong><small class="${o.coverage === o.coverageTotal ? 'good' : 'warn'}">${o.coverage === o.coverageTotal ? '全部步骤已覆盖' : '存在生产缺口'}</small></div></section><section class="panel"><div class="panel-head"><div><h2>当前告警</h2><p>只展示未恢复的告警；详情请到运行日志查看。</p></div><button class="secondary" id="dashboardOpenLogs">查看运行日志</button></div>${alertRows ? `<table class="table"><thead><tr><th>范围</th><th>指标</th><th>状态</th><th>最近比例</th></tr></thead><tbody>${alertRows}</tbody></table>` : '<div class="empty">当前没有活动告警</div>'}</section><div class="grid2"><section class="panel"><div class="panel-head"><div><h2>发布队列</h2><p>草稿和待审核数量</p></div><button class="secondary" id="dashboardOpenReleases">打开发布中心</button></div><div class="kv"><div class="item"><label>草稿</label><strong>${fmtNumber(o.drafts || 0)}</strong></div><div class="item"><label>待审核</label><strong>${fmtNumber(o.reviews || 0)}</strong></div><div class="item"><label>已发布</label><strong>${fmtNumber(o.published || 0)}</strong></div></div></section><section class="panel"><div class="panel-head"><div><h2>成本与重试</h2><p>近 7 天质量汇总</p></div><button class="secondary" id="dashboardOpenQuality">查看质量分析</button></div><div class="kv"><div class="item"><label>估算成本</label><strong>¥${fmtCost(q.cost || 0)}</strong></div><div class="item"><label>重试率</label><strong>${q.retryRate == null ? '—' : `${q.retryRate}%`}</strong></div><div class="item"><label>Schema 错误率</label><strong>${q.schemaErrorRate == null ? '—' : `${q.schemaErrorRate}%`}</strong></div></div></section></div>`;
+  }
+
+  function viewSystemHealth() {
+    const data = state.systemHealth;
+    if (!data) return `<div class="headline"><div><h1>系统健康</h1><p>检查后台运行所需的配置和数据状态。</p></div></div>${loading()}`;
+    const labels = { ok: ['正常', 'green'], warn: ['需关注', 'amber'], fail: ['异常', 'red'] };
+    const [summary, tone] = labels[data.status] || ['未知', 'grey'];
+    const rows = (data.checks || []).map(item => { const [label, itemTone] = labels[item.status] || ['未知', 'grey']; return `<tr><td><strong>${escapeHtml(item.label)}</strong><div class="prompt-meta">${escapeHtml(item.id)}</div></td><td>${tag(label, itemTone)}</td><td>${escapeHtml(item.detail)}</td></tr>`; }).join('');
+    return `<div class="headline"><div><h1>系统健康</h1><p>仅检查运行条件，不显示密钥、Prompt 正文或用户输入。</p></div><div class="actions">${tag(summary, tone)}<button class="secondary" id="reloadSystemHealth">刷新</button></div></div><section class="panel"><div class="panel-head"><div><h2>检查项</h2><p>最近检查：${fullTime(data.generatedAt)}</p></div></div>${rows ? `<table class="table"><thead><tr><th>检查项</th><th>状态</th><th>说明</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">暂无检查结果</div>'}</section>`;
+  }
+
   function viewFeedback() {
     const s = state.feedbackStats || { total: 0, good: 0, bad: 0, positiveRate: 0, open: 0, resolved: 0, byTag: [] };
-    const rows = state.feedback.map(item => `<tr><td class="prompt-meta">${fullTime(item.updatedAt)}</td><td>${tag(item.rating === 'good' ? '有效' : '需改进', item.rating === 'good' ? 'green' : 'red')}</td><td>${tag(item.status, item.status === 'resolved' ? 'green' : item.status === 'open' ? 'amber' : 'blue')}</td><td>${escapeHtml(item.role || '-')}</td><td>${escapeHtml((item.prompts || []).join('、') || '-')}</td><td>${escapeHtml((item.promptVersions || []).map(version => `${version.name}@${version.version}`).join('、') || '-')}</td><td>${escapeHtml((item.tags || []).join('、') || '-')}</td><td>${escapeHtml(item.comment || '-')}</td><td>${can('editor') ? `<select class="filter" data-feedback-status="${item.id}">${['open','reviewing','resolved','dismissed'].map(status => `<option value="${status}"${status === item.status ? ' selected' : ''}>${status}</option>`).join('')}</select>` : tag(item.owner || '未分派')}</td></tr>`).join('');
-    return `<div class="headline"><div><h1>质量反馈</h1><p>只记录运行元数据与人工评价，不复制 JD 或简历原文。</p></div><button class="secondary" id="reloadFeedback">刷新</button></div>
+    const rows = state.feedback.map(item => `<tr><td class="prompt-meta">${fullTime(item.updatedAt)}</td><td>${tag(item.rating === 'good' ? '有效' : '需改进', item.rating === 'good' ? 'green' : 'red')}</td><td>${tag(item.status, item.status === 'resolved' ? 'green' : item.status === 'open' ? 'amber' : 'blue')}</td><td>${escapeHtml(item.role || '-')}</td><td>${escapeHtml((item.prompts || []).join('、') || '-')}</td><td>${escapeHtml((item.promptVersions || []).map(version => `${version.name}@${version.version}`).join('、') || '-')}</td><td>${escapeHtml((item.tags || []).join('、') || '-')}</td><td>${escapeHtml(item.comment || '-')}</td><td>${item.loop ? `<div>${tag('已关联', 'green')}<div class="prompt-meta">${escapeHtml(item.loop.promptName)} · ${escapeHtml(item.loop.sourceVersion || '-')} ${item.loop.testCaseName ? `· ${escapeHtml(item.loop.testCaseName)}` : ''}</div></div>` : (can('editor') ? `<button class="iconbtn" data-feedback-link="${item.id}">建立闭环</button>` : tag('未关联'))}</td><td>${can('editor') ? `<select class="filter" data-feedback-status="${item.id}">${['open','reviewing','resolved','dismissed'].map(status => `<option value="${status}"${status === item.status ? ' selected' : ''}>${status}</option>`).join('')}</select>` : tag(item.owner || '未分派')}</td></tr>`).join('');
+    return `<div class="headline"><div><h1>质量反馈</h1><p>只记录运行元数据与人工评价，不复制 JD 或简历原文。</p></div><div class="actions"><button class="secondary" id="reloadFeedback">刷新</button></div></div>
+      <section class="panel"><div class="toolbar"><select class="filter" id="feedbackStatusFilter"><option value="">全部处理状态</option>${['open','reviewing','resolved','dismissed'].map(x => `<option value="${x}"${state.feedbackFilter.status === x ? ' selected' : ''}>${x}</option>`).join('')}</select><select class="filter" id="feedbackRatingFilter"><option value="">全部评价</option><option value="good"${state.feedbackFilter.rating === 'good' ? ' selected' : ''}>有效</option><option value="bad"${state.feedbackFilter.rating === 'bad' ? ' selected' : ''}>需改进</option></select><input class="filter" id="feedbackPromptFilter" placeholder="按 Prompt 筛选" value="${escapeHtml(state.feedbackFilter.prompt)}" /><button class="secondary" id="clearFeedbackFilters">清除筛选</button></div></section>
       ${can('editor') ? `<section class="panel"><div class="panel-head"><div><h2>新增反馈</h2><p>从运行日志的 ID 关联请求；不要粘贴 JD 或简历原文</p></div></div><div style="padding:18px"><div class="grid2"><div class="field"><label>运行记录 ID</label><input id="feedback-logId" placeholder="例如：mabc123-x7k9" /></div><div class="field"><label>评价</label><select id="feedback-rating"><option value="bad">需改进</option><option value="good">有效</option></select></div><div class="field"><label>问题标签</label><input id="feedback-tags" placeholder="例如：事实错误、结构不完整、格式问题" /></div><div class="field"><label>负责人</label><input id="feedback-owner" /></div></div><div class="field"><label>备注</label><textarea id="feedback-comment" style="min-height:90px" placeholder="记录可复现的问题和改进方向"></textarea></div><div style="display:flex;justify-content:flex-end"><button class="primary" id="saveFeedback">保存反馈</button></div></div></section>` : ''}
       <section class="stats"><div class="stat"><label>反馈总数</label><strong>${s.total}</strong><small>有效 ${s.good} · 需改进 ${s.bad}</small></div><div class="stat"><label>正向率</label><strong>${s.positiveRate}%</strong><small>基于人工反馈</small></div><div class="stat"><label>待处理</label><strong>${s.open}</strong><small>开放或审查中</small></div><div class="stat"><label>已解决</label><strong>${s.resolved}</strong><small>已闭环反馈</small></div></section>
-      <section class="panel"><div class="panel-head"><div><h2>反馈明细</h2><p>通过运行记录 ID 关联具体请求，并保留实际生效 Prompt 版本</p></div></div>${rows ? `<table class="table"><thead><tr><th>更新时间</th><th>评价</th><th>状态</th><th>岗位</th><th>Prompt</th><th>生效版本</th><th>问题标签</th><th>备注</th><th>处理状态</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">暂无质量反馈</div>'}</section>`;
+      <section class="panel"><div class="panel-head"><div><h2>反馈明细</h2><p>通过运行记录 ID 关联具体请求，并保留实际生效 Prompt 版本；闭环关联只保存 Prompt、版本和测试案例元数据</p></div></div>${rows ? `<table class="table"><thead><tr><th>更新时间</th><th>评价</th><th>状态</th><th>岗位</th><th>Prompt</th><th>生效版本</th><th>问题标签</th><th>备注</th><th>修复闭环</th><th>处理状态</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">暂无质量反馈</div>'}</section>`;
   }
 
   function viewRules() {
@@ -441,15 +484,24 @@
         : p.releaseStatus === 'draft' ? tag('草稿', 'blue') : tag('已发布', 'green');
       let actions = '<span class="prompt-meta">无需操作</span>';
       if (p.releaseStatus === 'draft') {
-        actions = can('editor') ? `<button class="iconbtn" data-act="edit" data-id="${p.id}">编辑</button><button class="iconbtn" data-act="submit-review" data-id="${p.id}">提交审核</button>` : '<span class="prompt-meta">等待编辑者提交</span>';
+        actions = can('editor') ? `<button class="iconbtn" data-act="edit" data-id="${p.id}">编辑</button><button class="iconbtn" data-act="release-checklist" data-id="${p.id}">检查清单</button><button class="iconbtn" data-act="submit-review" data-id="${p.id}">提交审核</button>` : '<span class="prompt-meta">等待编辑者提交</span>';
       } else if (p.releaseStatus === 'review') {
-        actions = can('admin') ? `<button class="iconbtn" data-act="reject-review" data-id="${p.id}">驳回</button><button class="primary" style="padding:6px 10px" data-act="publish" data-id="${p.id}">发布生产</button>` : '<span class="prompt-meta">等待管理员审核</span>';
+        actions = can('admin') ? `<button class="iconbtn" data-act="release-checklist" data-id="${p.id}">检查清单</button><button class="iconbtn" data-act="reject-review" data-id="${p.id}">驳回</button><button class="primary" style="padding:6px 10px" data-act="publish" data-id="${p.id}">发布生产</button>` : '<span class="prompt-meta">等待管理员审核</span>';
       }
+      if (p.canary?.active) {
+        const m = p.canary.metrics || {};
+        actions += `<div class="prompt-meta" style="margin-top:6px">灰度 ${escapeHtml(p.canary.version)} · ${p.canary.trafficPercent}% · ${m.calls || 0} 次 · 失败 ${m.failureRate || 0}% · Schema ${m.schemaErrorRate || 0}%</div>`;
+        if (can('editor')) actions += `<button class="iconbtn" data-act="canary-traffic" data-id="${p.id}">调整流量</button><button class="iconbtn" data-act="canary-stop" data-id="${p.id}">停止灰度</button>`;
+        if (can('admin')) actions += `<button class="primary" style="padding:6px 10px" data-act="canary-promote" data-id="${p.id}">全量发布</button>`;
+      } else if (p.publishedVersion && can('editor')) {
+        actions += `<button class="iconbtn" data-act="canary-start" data-id="${p.id}">启动灰度</button>`;
+      }
+      if (p.publishedVersion) actions += `<button class="iconbtn" data-act="release-comparison" data-id="${p.id}" data-version="${escapeHtml(p.publishedVersion)}">发布前后对比</button>`;
       return `<tr>
         <td><div class="prompt-name">${escapeHtml(p.name)}</div><div class="prompt-meta">${escapeHtml(p.desc || '')}</div></td>
         <td>${status}</td>
         <td><span class="version">${escapeHtml(p.version)}</span></td>
-        <td><span class="version">${escapeHtml(p.publishedVersion || '未发布')}</span></td>
+        <td><span class="version">${escapeHtml(p.publishedVersion || '未发布')}</span>${p.canary?.active ? `<div class="prompt-meta">灰度中</div>` : ''}</td>
         <td class="prompt-meta">${p.publishedAt ? fullTime(p.publishedAt) : '尚未发布'}</td>
         <td><div class="actions">${actions}<button class="iconbtn" data-act="history" data-id="${p.id}">版本历史</button></div></td>
       </tr>`;
@@ -465,21 +517,74 @@
       <div class="stat"><label>待审核</label><strong>${o.reviews || 0}</strong><small>等待管理员发布</small></div>
       <div class="stat"><label>待处理</label><strong>${pending.length}</strong><small>${pending.length ? '存在未上线修改' : '生产与工作区一致'}</small></div>
     </section>
-    <section class="panel">
-      <div class="panel-head"><div><h2>版本发布队列</h2><p>所有发布和回滚都会写入变更记录</p></div></div>
+      <section class="panel">
+      <div class="panel-head"><div><h2>版本发布队列</h2><p>所有发布、灰度和回滚都会写入变更记录；灰度版本不会覆盖生产版本</p></div></div>
       <table class="table"><thead><tr><th>Prompt</th><th>状态</th><th>工作版本</th><th>生产版本</th><th>最近发布</th><th></th></tr></thead><tbody>${rows}</tbody></table>
     </section>`;
+  }
+
+  function comparisonValue(value, suffix = '') {
+    return value === null || value === undefined ? '—' : `${escapeHtml(String(value))}${suffix}`;
+  }
+
+  function comparisonMetric(label, before, after, suffix = '') {
+    return `<div class="stat"><label>${escapeHtml(label)}</label><strong>${comparisonValue(before, suffix)} <span style="font-size:12px;color:#8490a0">→</span> ${comparisonValue(after, suffix)}</strong><small>发布前 → 发布后</small></div>`;
+  }
+
+  function releaseComparisonHtml(data) {
+    const beforeWindow = data.windows.before;
+    const afterWindow = data.windows.after;
+    const insufficient = data.status === 'insufficient_data';
+    const b = data.before || {}; const a = data.after || {};
+    return `<div class="drawer-head">
+      <div><h2>发布前后对比</h2><p class="prompt-meta">${escapeHtml(data.prompt.name)} · ${escapeHtml(data.version)} · 发布于 ${fullTime(data.release.at)}</p></div>
+      <button class="close" data-act="close-drawer">×</button>
+    </div>
+    <div class="hint" style="margin-top:8px">发布前：${escapeHtml(fullTime(beforeWindow.from))} 至 ${escapeHtml(fullTime(beforeWindow.to))}；发布后：${escapeHtml(fullTime(afterWindow.from))} 至 ${escapeHtml(fullTime(afterWindow.to))}</div>
+    ${insufficient ? '<div class="notice warning" style="margin-top:14px">样本不足：至少一个时间窗口没有调用样本，以下数据不能用于判断发布效果。</div>' : ''}
+    <section class="stats" style="margin-top:16px">
+      ${comparisonMetric('调用数', b.calls, a.calls)}
+      ${comparisonMetric('成功率', b.successRate, a.successRate, '%')}
+      ${comparisonMetric('失败率', b.failureRate, a.failureRate, '%')}
+      ${comparisonMetric('Schema 错误率', b.schemaErrorRate, a.schemaErrorRate, '%')}
+      ${comparisonMetric('重试率', b.retryRate, a.retryRate, '%')}
+      ${comparisonMetric('P50 延迟', b.p50Latency, a.p50Latency, ' ms')}
+      ${comparisonMetric('P95 延迟', b.p95Latency, a.p95Latency, ' ms')}
+      ${comparisonMetric('平均输入字符', b.avgInputChars, a.avgInputChars)}
+      ${comparisonMetric('Token 数', b.tokens, a.tokens)}
+      ${comparisonMetric('成本', b.cost, a.cost)}
+      ${comparisonMetric('反馈正向率', b.feedback?.positiveRate, a.feedback?.positiveRate, '%')}
+    </section>
+    <p class="prompt-meta" style="margin-top:16px">反馈样本：${comparisonValue(b.feedback?.total)} → ${comparisonValue(a.feedback?.total)}（good / bad：${comparisonValue(b.feedback?.good)} / ${comparisonValue(b.feedback?.bad)} → ${comparisonValue(a.feedback?.good)} / ${comparisonValue(a.feedback?.bad)}）</p>`;
+  }
+
+  async function openReleaseComparison(promptId, version) {
+    openDrawer(loading('加载发布前后对比…'), true);
+    try {
+      const data = await api(`/api/prompts/${encodeURIComponent(promptId)}/release-comparison?version=${encodeURIComponent(version)}`);
+      if (data.status === 'not_found') throw new Error('找不到该生产版本的发布记录');
+      openDrawer(releaseComparisonHtml(data), true);
+    } catch (error) {
+      closeDrawer();
+      toast(error.message, true);
+    }
+  }
+
+  async function openReleaseChecklist(promptId) {
+    openDrawer(loading('加载发布检查清单…'), true);
+    try {
+      const data = await api(`/api/prompts/${encodeURIComponent(promptId)}/release-checklist`);
+      const checklist = data.checklist;
+      const rows = checklist.checks.map(item => `<div class="vrow"><div><strong>${item.passed ? '✓' : '×'} ${escapeHtml(item.label)}</strong><div class="prompt-meta">${escapeHtml(item.detail)}</div></div>${item.blocking ? tag('阻断项', item.passed ? 'green' : 'red') : tag('提醒', 'amber')}</div>`).join('');
+      openDrawer(`<div class="drawer-head"><div><h2>发布前检查清单</h2><p>${escapeHtml(checklist.version)} · ${checklist.ready ? '已满足发布条件' : '存在阻断项'}</p></div><button class="close" data-act="close-drawer">×</button></div><div class="vlist">${rows}</div>`, true);
+    } catch (error) { closeDrawer(); toast(error.message, true); }
   }
 
   /* ---------- 视图：变更记录 ---------- */
 
   function viewChanges() {
-    if (!state.changes.length) return `<div class="headline"><div><h1>变更记录</h1><p>所有 Prompt 与运行参数的修改轨迹。</p></div></div>${loading('暂无变更记录')}`;
     const items = state.changes.map(v => {
-      const snap = v.snapshot || {};
-      const detail = v.action === 'update' || v.action === 'create'
-        ? `<div class="tl-note">版本 ${escapeHtml(v.version)} · ${escapeHtml(String(snap.content || '').slice(0, 90))}${String(snap.content || '').length > 90 ? '…' : ''}</div>`
-        : v.note ? `<div class="tl-note">${escapeHtml(v.note)}</div>` : '';
+      const detail = v.note ? `<div class="tl-note">${escapeHtml(v.note)}</div>` : '';
       return `<div class="tl-item ${v.action}">
         <div class="tl-body">
           <div class="tl-top">
@@ -491,10 +596,19 @@
         </div>
       </div>`;
     }).join('');
+    const actions = (state.changesMeta.actions || []).map(item => `<option value="${escapeHtml(item.value)}" ${state.changeFilter.action === item.value ? 'selected' : ''}>${escapeHtml(item.label)}</option>`).join('');
+    const empty = state.changes.length ? '' : '<div class="empty">所选条件下没有变更记录</div>';
+    const meta = state.changesMeta.total ? `<span class="muted">共 ${fmtNumber(state.changesMeta.total)} 条，第 ${state.changesMeta.page}/${state.changesMeta.pages} 页</span>` : '<span class="muted">共 0 条</span>';
     return `
       <div class="headline"><div><h1>变更记录</h1><p>所有 Prompt 与运行参数的修改轨迹，按时间倒序。</p></div>
-        <button class="secondary" id="reloadChanges">刷新</button></div>
-      <section class="panel"><div class="inner" style="padding:20px 18px"><div class="timeline">${items}</div></div></section>`;
+        <div class="actions"><button class="secondary" id="reloadChanges">刷新</button><button class="secondary" id="exportChanges">导出 CSV</button></div></div>
+      <section class="panel"><div class="inner" style="padding:16px 18px"><div class="filterbar changes-filter">
+        <label>操作类型<select id="changeAction"><option value="">全部</option>${actions}</select></label>
+        <label>操作人<input id="changeActor" value="${escapeHtml(state.changeFilter.actor)}" placeholder="姓名或账号"></label>
+        <label>开始日期<input id="changeFrom" type="date" value="${escapeHtml(state.changeFilter.from)}"></label>
+        <label>结束日期<input id="changeTo" type="date" value="${escapeHtml(state.changeFilter.to)}"></label>
+        <button class="secondary" id="clearChangeFilters">清除筛选</button>${meta}
+      </div><div class="timeline">${items}</div>${empty}</div></section>`;
   }
 
   /* ---------- 视图：运行日志 ---------- */
@@ -553,6 +667,68 @@
     }).join('');
   }
 
+  function qualityMetric(label, value, suffix = '') {
+    return `<div class="stat"><label>${escapeHtml(label)}</label><strong>${value == null ? '—' : `${escapeHtml(String(value))}${suffix}`}</strong></div>`;
+  }
+
+  function viewQuality() {
+    const data = state.quality;
+    if (!data) return `<div class="headline"><div><h1>质量分析</h1><p>按 Prompt 版本聚合运行结果与人工反馈，不展示输入正文。</p></div></div>${loading()}`;
+    const o = data.overall || {};
+    const promptRows = (data.byPrompt || []).map(item => `<tr><td><strong>${escapeHtml(item.prompt)}</strong></td><td>${escapeHtml(item.version)}</td><td>${item.calls}</td><td>${item.successRate}%</td><td>${item.schemaErrorRate}%</td><td>${item.retryRate}%</td><td>${fmtLatency(item.avgLatency)}</td><td>¥${fmtCost(item.cost)}</td><td>${item.feedback ? `${item.positiveRate}%（${item.feedback}）` : '—'}</td></tr>`).join('');
+    const roleRows = (data.byRole || []).map(item => `<tr><td>${escapeHtml(item.role)}</td><td>${item.calls}</td><td>${item.successRate}%</td><td>${item.failureRate}%</td><td>${fmtLatency(item.avgLatency)}</td><td>${item.feedback ? `${item.positiveRate}%（${item.feedback}）` : '—'}</td></tr>`).join('');
+    return `<div class="headline"><div><h1>质量分析</h1><p>按 Prompt 版本和目标岗位查看成功率、结构错误、重试、延迟、成本与人工反馈。统计窗口：近 ${data.days} 天。</p></div><div class="actions"><select class="filter" id="qualityDays"><option value="7"${data.days === 7 ? ' selected' : ''}>近 7 天</option><option value="30"${data.days === 30 ? ' selected' : ''}>近 30 天</option><option value="90"${data.days === 90 ? ' selected' : ''}>近 90 天</option></select><button class="secondary" id="reloadQuality">刷新</button><button class="secondary" id="exportQuality">导出 CSV</button></div></div>
+      <section class="stats">${qualityMetric('调用次数', o.calls)}${qualityMetric('成功率', o.successRate, '%')}${qualityMetric('Schema 错误率', o.schemaErrorRate, '%')}${qualityMetric('人工正向率', o.feedback ? o.positiveRate : null, o.feedback ? '%' : '')}${qualityMetric('平均延迟', fmtLatency(o.avgLatency))}${qualityMetric('总成本', `¥${fmtCost(o.cost)}`)}</section>
+      <section class="panel"><div class="panel-head"><div><h2>Prompt 版本质量</h2><p>反馈率只基于已关联运行记录的人工评价；“—”表示没有反馈样本。</p></div></div>${promptRows ? `<table class="table"><thead><tr><th>Prompt</th><th>版本</th><th>调用</th><th>成功率</th><th>Schema 错误</th><th>重试率</th><th>平均延迟</th><th>成本</th><th>人工正向率</th></tr></thead><tbody>${promptRows}</tbody></table>` : '<div class="empty">所选区间没有运行记录</div>'}</section>
+      <section class="panel"><div class="panel-head"><div><h2>岗位维度</h2><p>用于发现某类岗位的质量回退，不包含岗位描述正文。</p></div></div>${roleRows ? `<table class="table"><thead><tr><th>目标岗位</th><th>调用</th><th>成功率</th><th>失败率</th><th>平均延迟</th><th>人工正向率</th></tr></thead><tbody>${roleRows}</tbody></table>` : '<div class="empty">所选区间没有岗位维度数据</div>'}</section>`;
+  }
+
+  function experimentMetric(group) {
+    return `<td>${fmtNumber(group.calls)}</td><td>${group.calls ? `${group.successRate}%` : '—'}</td><td>${group.calls ? `${group.schemaErrorRate}%` : '—'}</td><td>${group.calls ? `${group.retryRate}%` : '—'}</td><td>${group.calls ? `${fmtLatency(group.p50Latency)} / ${fmtLatency(group.p95Latency)}` : '—'}</td><td>${group.calls ? `¥${fmtCost(group.cost)}` : '—'}</td><td>${group.feedback.total ? `${group.feedback.positiveRate}%（${group.feedback.total}）` : '—'}</td>`;
+  }
+
+  function viewExperiments() {
+    const data = state.experiments;
+    if (!data) return `<div class="headline"><div><h1>实验中心</h1><p>比较进行中的 Prompt 灰度对照组与候选组。</p></div></div>${loading()}`;
+    const statusLabel = { insufficient_data: ['样本不足', 'amber'], observing: ['观察中', 'blue'], candidate_better: ['候选更优', 'green'], candidate_worse: ['候选较差', 'red'], inconclusive: ['暂无结论', 'grey'] };
+    const rows = (data.items || []).map(item => {
+      const [label, tone] = statusLabel[item.status] || ['未知', 'grey'];
+      return `<tr><td><strong>${escapeHtml(item.promptName)}</strong><div class="prompt-meta">${escapeHtml(item.promptId)}</div></td><td>${escapeHtml(item.sourceVersion)}</td><td>${escapeHtml(item.candidateVersion)}</td><td>${item.trafficPercent}%</td><td>${tag(label, tone)}<div class="prompt-meta">${item.sufficientData ? '两组样本充足' : `每组至少 ${item.minCalls} 次`}</div></td><td>${experimentMetric(item.control)}</td><td>${experimentMetric(item.candidate)}</td></tr>`;
+    }).join('');
+    return `<div class="headline"><div><h1>实验中心</h1><p>进行中的灰度实验，统计窗口：近 ${data.days} 天。P50 / P95 仅基于成功请求；成本按 Prompt 版本均摊。</p></div><div class="actions"><select class="filter" id="experimentDays"><option value="7"${data.days === 7 ? ' selected' : ''}>近 7 天</option><option value="30"${data.days === 30 ? ' selected' : ''}>近 30 天</option><option value="90"${data.days === 90 ? ' selected' : ''}>近 90 天</option></select><button class="secondary" id="reloadExperiments">刷新</button></div></div><section class="panel"><div class="panel-head"><div><h2>对照组 vs 候选组</h2><p>状态只在两组均达到最小样本量后计算；样本不足不会判定候选版本优劣。</p></div></div>${rows ? `<div style="overflow:auto"><table class="table"><thead><tr><th>Prompt</th><th>对照版本</th><th>候选版本</th><th>灰度流量</th><th>结论</th><th colspan="7">对照组：调用 / 成功率 / Schema 错误 / 重试 / P50-P95 / 成本 / 正向反馈</th><th colspan="7">候选组：调用 / 成功率 / Schema 错误 / 重试 / P50-P95 / 成本 / 正向反馈</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div class="empty">暂无进行中的灰度实验</div>'}</section>`;
+  }
+
+  function viewRegressionCenter() {
+    const data = state.regressionCenter;
+    if (!data) return `<div class="headline"><div><h1>回归中心</h1><p>统一查看所有 Prompt 的回归门禁状态。</p></div></div>${loading()}`;
+    const labels = { no_cases: ['未配置案例', 'grey'], not_run: ['未运行', 'amber'], passed: ['通过', 'green'], failed: ['失败', 'red'], stale: ['已过期', 'amber'] };
+    const rows = (data.items || []).map(item => {
+      const [label, tone] = labels[item.status] || ['未知', 'grey'];
+      const latest = item.latest;
+      return `<tr><td><strong>${escapeHtml(item.promptName)}</strong><div class="prompt-meta">${item.step ? `步骤 ${item.step}` : '扩展'} · ${escapeHtml(item.promptId)}</div></td><td>${escapeHtml(item.version)} / ${escapeHtml(item.publishedVersion || '未发布')}</td><td>${item.caseCount}</td><td>${tag(label, tone)}${item.status === 'stale' ? '<div class="prompt-meta">草稿或案例已变更</div>' : ''}</td><td>${latest ? `${fullTime(latest.at)}<div class="prompt-meta">${latest.total} 个案例 · 失败 ${latest.failed} · ${escapeHtml(latest.actor || '未知')}</div>` : '—'}</td><td>${latest ? escapeHtml(latest.promptVersion || '-') : '—'}</td><td>${can('editor') && item.caseCount ? `<button class="iconbtn" data-regression-run="${escapeHtml(item.promptId)}">运行回归</button>` : '<span class="prompt-meta">—</span>'}</td></tr>`;
+    }).join('');
+    return `<div class="headline"><div><h1>回归中心</h1><p>统一查看所有 Prompt 的测试案例与发布门禁；运行操作仍按 Prompt 单独执行。</p></div><button class="secondary" id="reloadRegressionCenter">刷新</button></div><section class="panel"><div class="panel-head"><div><h2>门禁状态</h2><p>“已过期”表示最近一次通过记录对应的草稿修订或案例集合已发生变化。</p></div></div>${rows ? `<div style="overflow:auto"><table class="table"><thead><tr><th>Prompt</th><th>工作 / 生产版本</th><th>案例数</th><th>状态</th><th>最近运行</th><th>测试版本</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div class="empty">暂无 Prompt</div>'}</section>`;
+  }
+
+  function viewTasks() {
+    const data = state.tasks;
+    if (!data) return `<div class="headline"><div><h1>任务中心</h1><p>集中查看简历分析任务状态与失败诊断。</p></div></div>${loading()}`;
+    const summary = data.summary || { total: 0, succeeded: 0, failed: 0, retryable: 0, cost: 0 };
+    const rows = (data.items || []).map(task => `<tr>
+      <td class="prompt-meta">${fullTime(task.at)}</td>
+      <td>${tag(task.status === 'succeeded' ? '成功' : '失败', task.status === 'succeeded' ? 'green' : 'red')}</td>
+      <td>${escapeHtml(task.role || '-')}</td><td>${escapeHtml(task.model || '-')}</td>
+      <td>${escapeHtml((task.promptVersions || []).map(v => `${v.name}@${v.version}`).join('、') || '-')}</td>
+      <td>${fmtLatency(task.latencyMs)}</td><td>${fmtNumber(task.totalTokens)}</td><td>¥${fmtCost(task.cost)}</td>
+      <td>${task.status === 'failed' ? `<span class="tag ${task.retryable ? 'amber' : 'grey'}">${task.retryable ? '可重试' : '不可重试'}</span><div class="prompt-meta">${escapeHtml(task.errorLabel || task.code || '调用失败')}</div>` : '<span class="prompt-meta">—</span>'}</td>
+      <td><button class="iconbtn" data-log-detail="${escapeHtml(task.id)}">详情</button></td></tr>`).join('');
+    const page = data.page || 1; const pages = data.pages || 1;
+    return `<div class="headline"><div><h1>任务中心</h1><p>按分析运行记录汇总任务状态；只展示运营元数据，不保存 JD 或简历正文。</p></div><div class="actions"><select class="filter" id="taskDays"><option value="1"${state.taskFilter.days === 1 ? ' selected' : ''}>近 1 天</option><option value="7"${state.taskFilter.days === 7 ? ' selected' : ''}>近 7 天</option><option value="30"${state.taskFilter.days === 30 ? ' selected' : ''}>近 30 天</option><option value="0"${state.taskFilter.days === 0 ? ' selected' : ''}>全部</option></select><button class="secondary" id="reloadTasks">刷新</button></div></div>
+      <section class="stats"><div class="stat"><label>任务总数</label><strong>${fmtNumber(summary.total)}</strong><small>当前筛选范围</small></div><div class="stat"><label>成功</label><strong>${fmtNumber(summary.succeeded)}</strong><small>已完成分析</small></div><div class="stat"><label>失败</label><strong>${fmtNumber(summary.failed)}</strong><small class="${summary.failed ? 'warn' : 'good'}">需要诊断 ${summary.failed}</small></div><div class="stat"><label>可重试</label><strong>${fmtNumber(summary.retryable)}</strong><small>需重新提交输入</small></div><div class="stat"><label>估算成本</label><strong>¥${fmtCost(summary.cost)}</strong><small>按项目单价计算</small></div></section>
+      <section class="panel"><div class="panel-head"><div><h2>任务筛选</h2><p>失败任务的重试资格由服务端错误码判定；后台不保留原始输入，因此不会提供伪造的一键重试。</p></div></div><div class="filters"><select class="filter" id="taskStatus"><option value=""${!state.taskFilter.status ? ' selected' : ''}>全部状态</option><option value="succeeded"${state.taskFilter.status === 'succeeded' ? ' selected' : ''}>成功</option><option value="failed"${state.taskFilter.status === 'failed' ? ' selected' : ''}>失败</option></select><input class="filter" id="taskRole" placeholder="按岗位搜索" value="${escapeHtml(state.taskFilter.role)}" /><button class="secondary" id="clearTaskFilters">清除筛选</button></div></section>
+      <section class="panel"><div class="panel-head"><div><h2>任务列表</h2><p>第 ${page} / ${pages} 页，共 ${fmtNumber(data.total)} 条</p></div><div class="actions"><button class="secondary" id="taskPrev" ${page <= 1 ? 'disabled' : ''}>上一页</button><button class="secondary" id="taskNext" ${page >= pages ? 'disabled' : ''}>下一页</button></div></div>${rows ? `<table class="table"><thead><tr><th>时间</th><th>状态</th><th>岗位</th><th>模型</th><th>Prompt 版本</th><th>耗时</th><th>Token</th><th>成本</th><th>失败诊断</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">当前筛选范围没有任务</div>'}</section>`;
+  }
+
   function viewLogs() {
     const s = state.logStats;
     if (!s) return `<div class="headline"><div><h1>运行日志</h1><p>每次分析的模型、耗时、token、成本与错误分布。</p></div></div>${loading()}`;
@@ -588,7 +764,7 @@
         <td class="version" title="输入 / 输出 token">${usage}</td>
         <td class="version">${l.usage ? fmtCost(l.cost) : '—'}</td>
         <td>${l.code ? `<span class="tag red" title="${escapeHtml(l.error || '')}">${escapeHtml(l.code)}</span>` : '<span class="prompt-meta">—</span>'}</td>
-        <td class="prompt-meta">${notes.join('') || '—'}</td>
+        <td class="prompt-meta">${notes.join('') || '—'} <button class="iconbtn" data-log-detail="${escapeHtml(l.id)}">详情</button></td>
       </tr>`;
     }).join('');
 
@@ -600,6 +776,7 @@
             ${[1, 7, 30, 90].map(d => `<option value="${d}"${state.logDays === d ? ' selected' : ''}>近 ${d} 天</option>`).join('')}
           </select>
           <button class="secondary" id="reloadLogs">刷新</button>
+          <button class="secondary" id="exportLogs">导出 CSV</button>
           ${can('admin') ? '<button class="secondary" id="pruneLogs">清理过期</button>' : ''}
         </div>
       </div>
@@ -694,12 +871,18 @@
           <div class="grid2">
             <div class="field"><label>输入单价（元 / 百万 token）</label><input id="s-inputPricePerM" type="number" step="0.1" min="0" value="${s.inputPricePerM}" /></div>
             <div class="field"><label>输出单价（元 / 百万 token）</label><input id="s-outputPricePerM" type="number" step="0.1" min="0" value="${s.outputPricePerM}" /></div>
+            <div class="field"><label>每日成本预算（元）</label><input id="s-dailyCostBudget" type="number" step="0.01" min="0" max="100000" value="${s.dailyCostBudget || 0}" /><div class="hint">设为 0 关闭预算监控；超预算只告警，不会停止分析。</div></div>
             <div class="field"><label>日志保留天数（1–365）</label><input id="s-logRetentionDays" type="number" min="1" max="365" value="${s.logRetentionDays}" /></div>
             <div class="field"><label>失败率告警阈值（%）</label><input id="s-alertFailureRate" type="number" min="0" max="100" value="${s.alertFailureRate}" /><div class="hint">设为 0 可关闭该项告警</div></div>
             <div class="field"><label>Schema 错误率告警阈值（%）</label><input id="s-alertSchemaErrorRate" type="number" min="0" max="100" value="${s.alertSchemaErrorRate}" /></div>
             <div class="field"><label>重试率告警阈值（%）</label><input id="s-alertRetryRate" type="number" min="0" max="100" value="${s.alertRetryRate}" /></div>
             <div class="field"><label>触发告警的最少调用数</label><input id="s-alertMinCalls" type="number" min="1" max="10000" value="${s.alertMinCalls}" /></div>
+            <div class="field"><label>灰度失败率熔断阈值（%）</label><input id="s-canaryFailureRate" type="number" min="0" max="100" value="${s.canaryFailureRate}" /><div class="hint">设为 0 可关闭失败率熔断</div></div>
+            <div class="field"><label>灰度 Schema 错误率熔断阈值（%）</label><input id="s-canarySchemaErrorRate" type="number" min="0" max="100" value="${s.canarySchemaErrorRate}" /></div>
+            <div class="field"><label>灰度自动熔断最少调用数</label><input id="s-canaryMinCalls" type="number" min="1" max="10000" value="${s.canaryMinCalls}" /></div>
+            <div class="field"><label>灰度自动熔断</label><select id="s-canaryAutoStop"><option value="true"${s.canaryAutoStop ? ' selected' : ''}>启用</option><option value="false"${s.canaryAutoStop ? '' : ' selected'}>停用</option></select><div class="hint">达到最少调用数且超过任一阈值时停止灰度</div></div>
             <div class="field"><label>Webhook 告警通知</label><select id="s-alertNotificationsEnabled"><option value="true"${s.alertNotificationsEnabled ? ' selected' : ''}>启用</option><option value="false"${s.alertNotificationsEnabled ? '' : ' selected'}>停用</option></select><div class="hint">地址与令牌只从服务端环境变量读取；当前配置：${s.alertWebhookConfigured ? '已配置' : '未配置'}。最近状态：${lastNotification ? `${escapeHtml(lastNotification.status)} · ${fullTime(lastNotification.at)}` : '暂无记录'}</div></div>
+            <div class="field"><label>发布冻结</label><select id="s-releaseFreeze"><option value="false"${s.releaseFreeze ? '' : ' selected'}>允许生产变更</option><option value="true"${s.releaseFreeze ? ' selected' : ''}>冻结发布、灰度与生产回滚</option></select><input id="s-releaseFreezeReason" placeholder="冻结原因（可选）" value="${escapeHtml(s.releaseFreezeReason || '')}" /><div class="hint">冻结只阻止生产变更，不影响用户分析、日志和查看功能。</div></div>
           </div>
           <div style="display:flex;justify-content:flex-end;gap:9px;margin-top:6px">
             <button class="secondary" id="reloadSettings">放弃修改</button>
@@ -722,6 +905,33 @@
   function closeDrawer() {
     $('#drawer').classList.remove('open');
     $('#drawerBody').innerHTML = '';
+  }
+
+  async function openLogDetail(id) {
+    try {
+      const data = await api(`/api/logs/${encodeURIComponent(id)}`);
+      const item = data.item || {};
+      const usage = item.usage ? `${fmtNumber(item.usage.prompt_tokens)} / ${fmtNumber(item.usage.completion_tokens)} / ${fmtNumber(item.usage.total_tokens)}` : '—';
+      const versions = (item.promptVersions || []).map(version => `${version.name || ''}@${version.version || ''}`).join('、') || '—';
+      const list = (values, empty = '无') => values && values.length ? values.map(value => escapeHtml(value)).join('、') : empty;
+      openDrawer(`<div class="drawer-head"><div><h2>运行日志详情</h2><p>${escapeHtml(item.id || id)} · ${fullTime(item.at)}</p></div><button class="close" data-act="close-drawer">×</button></div>
+        <div class="grid2">
+          <div class="field"><label>状态</label><div>${item.ok ? tag('成功', 'green') : tag('失败', 'red')} ${escapeHtml(item.errorLabel || '')}</div></div>
+          <div class="field"><label>错误码</label><div>${escapeHtml(item.code || '—')}</div></div>
+          <div class="field"><label>模型</label><div>${escapeHtml(item.model || '—')}${item.modelReturned ? ` · 返回 ${escapeHtml(item.modelReturned)}` : ''}</div></div>
+          <div class="field"><label>目标岗位</label><div>${escapeHtml(item.role || '—')}</div></div>
+          <div class="field"><label>Prompt 版本</label><div>${escapeHtml(versions)}</div></div>
+          <div class="field"><label>耗时 / 尝试</label><div>${fmtLatency(item.latencyMs)} · ${item.attempts || 1} 次</div></div>
+          <div class="field"><label>Token（输入 / 输出 / 总计）</label><div>${usage}</div></div>
+          <div class="field"><label>成本</label><div>¥${fmtCost(item.cost)}</div></div>
+          <div class="field"><label>输入字符数</label><div>${fmtNumber(item.inputChars)}</div></div>
+          <div class="field"><label>截断 / 丢弃</label><div>${item.truncatedCount || 0} / ${item.droppedCount || 0}</div></div>
+        </div>
+        <div class="field"><label>结构校验错误</label><div>${list(item.schemaErrors)}</div></div>
+        <div class="field"><label>风险命中摘要</label><div>${list(item.riskHits)}</div></div>
+        <div class="field"><label>调用 Prompt</label><div>${list(item.prompts)}</div></div>
+        <p class="prompt-meta">详情仅展示运行元数据，不包含 JD、简历、Prompt 正文或上游原始错误。</p>`, true);
+    } catch (error) { toast(error.message, true); }
   }
 
   function editorHtml(prompt) {
@@ -929,10 +1139,69 @@
 
   async function loadChanges() {
     try {
-      const data = await api('/api/changes?limit=120');
-      state.changes = data.items;
+      const params = new URLSearchParams({ limit: '120', page: '1' });
+      Object.entries(state.changeFilter).forEach(([key, value]) => { if (value) params.set(key, value); });
+      const data = await api(`/api/changes?${params}`);
+      state.changes = data.items || [];
+      state.changesMeta = { total: data.total || 0, page: data.page || 1, pages: data.pages || 1, actions: data.actions || [] };
+      clearConnError();
       render();
     } catch (error) { showConnError(`变更记录加载失败：${error.message}`); }
+  }
+
+  function csvCell(value) {
+    const text = String(value == null ? '' : value).replace(/\r?\n/g, ' ');
+    return `"${text.replace(/"/g, '""')}"`;
+  }
+
+  function exportChanges() {
+    const headers = ['时间', '操作类型', 'Prompt', '版本', '操作人', '备注'];
+    const rows = state.changes.map(item => [fullTime(item.at), item.actionLabel || item.action, item.promptName || '', item.version || '', item.actor || '', item.note || '']);
+    const csv = '\uFEFF' + [headers, ...rows].map(row => row.map(csvCell).join(',')).join('\r\n') + '\r\n';
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `变更记录-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(link); link.click(); link.remove(); URL.revokeObjectURL(url);
+    toast(`已导出 ${state.changes.length} 条变更记录`);
+  }
+
+  async function exportLogs() {
+    const params = new URLSearchParams({ days: String(state.logDays), limit: '5000' });
+    if (state.logFilter.ok !== 'all') params.set('ok', state.logFilter.ok);
+    ['model', 'prompt', 'role'].forEach(key => { if (state.logFilter[key]) params.set(key, state.logFilter[key]); });
+    if (state.logFilter.minLatency) params.set('minLatency', String(state.logFilter.minLatency));
+    const data = await api(`/api/logs?${params}`);
+    const headers = ['时间', '状态', '模型', '岗位', 'Prompt 版本', '耗时毫秒', '输入 Token', '输出 Token', '成本', '错误码', '重试次数', '输入字符', 'Schema 错误数', '截断条数', '丢弃条数'];
+    const rows = (data.items || []).map(item => [
+      fullTime(item.at), item.ok ? '成功' : '失败', item.model || '', item.role || '',
+      (item.promptVersions || []).map(version => `${version.name || ''}@${version.version || ''}`).join('；'),
+      item.latencyMs || 0, item.usage?.prompt_tokens || '', item.usage?.completion_tokens || '', item.cost ?? '',
+      item.code || '', item.attempts || 1, item.inputChars || 0, (item.validationErrors || []).length,
+      (item.truncated || []).length, (item.dropped || []).length
+    ]);
+    const csv = '\uFEFF' + [headers, ...rows].map(row => row.map(csvCell).join(',')).join('\r\n') + '\r\n';
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a'); link.href = url;
+    link.download = `运行日志-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(link); link.click(); link.remove(); URL.revokeObjectURL(url);
+    toast(`已导出 ${rows.length} 条运行日志`);
+  }
+
+  function exportQuality() {
+    const data = state.quality;
+    if (!data) throw new Error('质量分析数据尚未加载');
+    const headers = ['统计窗口', '维度', 'Prompt/岗位', '版本', '调用', '成功率', '失败率', 'Schema错误率', '重试率', '平均延迟毫秒', 'P50延迟毫秒', 'P95延迟毫秒', 'Token', '成本', '反馈数', '人工正向率'];
+    const rows = []; const o = data.overall || {};
+    rows.push([`近${data.days}天`, '总体', '全部', '', o.calls || 0, o.successRate ?? '', o.failureRate ?? '', o.schemaErrorRate ?? '', o.retryRate ?? '', o.avgLatency ?? '', o.p50Latency ?? '', o.p95Latency ?? '', o.tokens || 0, o.cost || 0, o.feedback || 0, o.positiveRate ?? '']);
+    (data.byPrompt || []).forEach(item => rows.push([`近${data.days}天`, 'Prompt版本', item.prompt || '', item.version || '', item.calls || 0, item.successRate ?? '', item.failureRate ?? '', item.schemaErrorRate ?? '', item.retryRate ?? '', item.avgLatency ?? '', '', '', item.tokens || 0, item.cost || 0, item.feedback || 0, item.positiveRate ?? '']));
+    (data.byRole || []).forEach(item => rows.push([`近${data.days}天`, '岗位', item.role || '', '', item.calls || 0, item.successRate ?? '', item.failureRate ?? '', item.schemaErrorRate ?? '', item.retryRate ?? '', item.avgLatency ?? '', '', '', item.tokens || 0, item.cost || 0, item.feedback || 0, item.positiveRate ?? '']));
+    const csv = '\uFEFF' + [headers, ...rows].map(row => row.map(csvCell).join(',')).join('\r\n') + '\r\n';
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' }); const url = URL.createObjectURL(blob); const link = document.createElement('a');
+    link.href = url; link.download = `质量分析-${data.days}天-${new Date().toISOString().slice(0, 10)}.csv`; document.body.appendChild(link); link.click(); link.remove(); URL.revokeObjectURL(url);
+    toast(`已导出 ${rows.length} 条质量汇总`);
   }
 
   async function loadLogs() {
@@ -948,9 +1217,66 @@
     } catch (error) { showConnError(`运行日志加载失败：${error.message}`); }
   }
 
+  async function loadTasks() {
+    try {
+      const f = state.taskFilter;
+      const params = new URLSearchParams({ page: String(f.page), limit: '50', days: String(f.days) });
+      if (f.status) params.set('status', f.status);
+      if (f.role) params.set('role', f.role);
+      state.tasks = await api(`/api/tasks?${params}`);
+      clearConnError();
+      render();
+    } catch (error) { showConnError(`任务中心加载失败：${error.message}`); }
+  }
+
+  async function loadQuality() {
+    try {
+      state.quality = await api(`/api/quality?days=${state.qualityDays}`);
+      clearConnError();
+      render();
+    } catch (error) { showConnError(`质量分析加载失败：${error.message}`); }
+  }
+
+  async function loadExperiments() {
+    try {
+      state.experiments = await api(`/api/experiments?days=${state.experimentDays}`);
+      clearConnError();
+      render();
+    } catch (error) { showConnError(`实验中心加载失败：${error.message}`); }
+  }
+
+  async function loadRegressionCenter() {
+    try {
+      state.regressionCenter = await api('/api/regression-center');
+      clearConnError();
+      render();
+    } catch (error) { showConnError(`回归中心加载失败：${error.message}`); }
+  }
+
+  async function loadDashboard() {
+    try {
+      const [overview, quality, tasks, alerts, budget] = await Promise.all([
+        api('/api/overview'), api('/api/quality?days=7'), api('/api/tasks?days=7&limit=1'), api('/api/alerts?limit=100'), api('/api/cost-budget')
+      ]);
+      state.dashboard = { overview, quality, tasks, alerts, budget };
+      clearConnError();
+      render();
+    } catch (error) { showConnError(`运营总览加载失败：${error.message}`); }
+  }
+
+  async function loadSystemHealth() {
+    try {
+      state.systemHealth = await api('/api/system-health');
+      clearConnError();
+      render();
+    } catch (error) { showConnError(`系统健康加载失败：${error.message}`); }
+  }
+
   async function loadFeedback() {
     try {
-      const data = await api('/api/feedback?limit=200');
+      const params = new URLSearchParams({ limit: '200' });
+      Object.entries(state.feedbackFilter).forEach(([key, value]) => { if (value) params.set(key, value); });
+      const data = await api(`/api/feedback?${params}`);
       state.feedback = data.items || [];
       state.feedbackStats = data.stats || null;
       clearConnError();
@@ -1124,12 +1450,34 @@
     // 变更记录
     const reloadChanges = $('#reloadChanges');
     if (reloadChanges) reloadChanges.addEventListener('click', loadChanges);
+    const exportChangesButton = $('#exportChanges');
+    if (exportChangesButton) exportChangesButton.addEventListener('click', exportChanges);
+    const bindChangeFilter = (id, key) => {
+      const el = $(id);
+      if (el) el.addEventListener('change', () => { state.changeFilter[key] = el.value.trim(); loadChanges(); });
+    };
+    bindChangeFilter('#changeAction', 'action');
+    bindChangeFilter('#changeFrom', 'from');
+    bindChangeFilter('#changeTo', 'to');
+    const changeActor = $('#changeActor');
+    if (changeActor) {
+      let changeTimer;
+      changeActor.addEventListener('input', () => { clearTimeout(changeTimer); changeTimer = setTimeout(() => { state.changeFilter.actor = changeActor.value.trim(); loadChanges(); }, 300); });
+    }
+    const clearChangeFilters = $('#clearChangeFilters');
+    if (clearChangeFilters) clearChangeFilters.addEventListener('click', () => { state.changeFilter = { action: '', actor: '', from: '', to: '' }; loadChanges(); });
 
     // 运行日志
     const logDays = $('#logDays');
     if (logDays) logDays.addEventListener('change', () => { state.logDays = Number(logDays.value); loadLogs(); });
     const reloadLogs = $('#reloadLogs');
     if (reloadLogs) reloadLogs.addEventListener('click', loadLogs);
+    const exportLogsButton = $('#exportLogs');
+    if (exportLogsButton) exportLogsButton.addEventListener('click', async () => {
+      exportLogsButton.disabled = true;
+      try { await exportLogs(); } catch (error) { toast(error.message, true); }
+      finally { exportLogsButton.disabled = false; }
+    });
     const pruneLogs = $('#pruneLogs');
     if (pruneLogs) pruneLogs.addEventListener('click', async () => {
       try { const r = await api('/api/logs/prune', { method: 'POST' }); toast(`已清理，保留 ${r.kept} 条`); loadLogs(); }
@@ -1154,8 +1502,65 @@
     const clearLogFilters = $('#clearLogFilters');
     if (clearLogFilters) clearLogFilters.addEventListener('click', () => { state.logFilter = { ok: 'all', model: '', prompt: '', role: '', minLatency: 0 }; loadLogs(); });
 
+    // 任务中心
+    const taskDays = $('#taskDays');
+    if (taskDays) taskDays.addEventListener('change', () => { state.taskFilter.days = Number(taskDays.value); state.taskFilter.page = 1; loadTasks(); });
+    const taskStatus = $('#taskStatus');
+    if (taskStatus) taskStatus.addEventListener('change', () => { state.taskFilter.status = taskStatus.value; state.taskFilter.page = 1; loadTasks(); });
+    const taskRole = $('#taskRole');
+    if (taskRole) {
+      let taskTimer;
+      taskRole.addEventListener('input', () => { clearTimeout(taskTimer); taskTimer = setTimeout(() => { state.taskFilter.role = taskRole.value.trim(); state.taskFilter.page = 1; loadTasks(); }, 300); });
+    }
+    const clearTaskFilters = $('#clearTaskFilters');
+    if (clearTaskFilters) clearTaskFilters.addEventListener('click', () => { state.taskFilter = { status: '', role: '', days: 7, page: 1 }; loadTasks(); });
+    const reloadTasks = $('#reloadTasks');
+    if (reloadTasks) reloadTasks.addEventListener('click', loadTasks);
+    const taskPrev = $('#taskPrev');
+    if (taskPrev) taskPrev.addEventListener('click', () => { state.taskFilter.page -= 1; loadTasks(); });
+    const taskNext = $('#taskNext');
+    if (taskNext) taskNext.addEventListener('click', () => { state.taskFilter.page += 1; loadTasks(); });
+
+    // 质量分析
+    const qualityDays = $('#qualityDays');
+    if (qualityDays) qualityDays.addEventListener('change', () => { state.qualityDays = Number(qualityDays.value); loadQuality(); });
+    const reloadQuality = $('#reloadQuality');
+    if (reloadQuality) reloadQuality.addEventListener('click', loadQuality);
+    const exportQualityButton = $('#exportQuality');
+    if (exportQualityButton) exportQualityButton.addEventListener('click', () => { try { exportQuality(); } catch (error) { toast(error.message, true); } });
+
+    const experimentDays = $('#experimentDays');
+    if (experimentDays) experimentDays.addEventListener('change', () => { state.experimentDays = Number(experimentDays.value); loadExperiments(); });
+    const reloadExperiments = $('#reloadExperiments');
+    if (reloadExperiments) reloadExperiments.addEventListener('click', loadExperiments);
+
+    const reloadRegressionCenter = $('#reloadRegressionCenter');
+    if (reloadRegressionCenter) reloadRegressionCenter.addEventListener('click', loadRegressionCenter);
+    $$('[data-regression-run]').forEach(button => button.addEventListener('click', () => {
+      state.testForm.promptId = String(button.dataset.regressionRun);
+      navigate('tests');
+    }));
+    const reloadDashboard = $('#reloadDashboard');
+    if (reloadDashboard) reloadDashboard.addEventListener('click', loadDashboard);
+    const dashboardOpenLogs = $('#dashboardOpenLogs');
+    if (dashboardOpenLogs) dashboardOpenLogs.addEventListener('click', () => navigate('logs'));
+    const dashboardOpenReleases = $('#dashboardOpenReleases');
+    if (dashboardOpenReleases) dashboardOpenReleases.addEventListener('click', () => navigate('releases'));
+    const dashboardOpenQuality = $('#dashboardOpenQuality');
+    if (dashboardOpenQuality) dashboardOpenQuality.addEventListener('click', () => navigate('quality'));
+    const reloadSystemHealth = $('#reloadSystemHealth');
+    if (reloadSystemHealth) reloadSystemHealth.addEventListener('click', loadSystemHealth);
+
     const reloadFeedback = $('#reloadFeedback');
     if (reloadFeedback) reloadFeedback.addEventListener('click', loadFeedback);
+    const feedbackStatusFilter = $('#feedbackStatusFilter');
+    if (feedbackStatusFilter) feedbackStatusFilter.addEventListener('change', () => { state.feedbackFilter.status = feedbackStatusFilter.value; loadFeedback(); });
+    const feedbackRatingFilter = $('#feedbackRatingFilter');
+    if (feedbackRatingFilter) feedbackRatingFilter.addEventListener('change', () => { state.feedbackFilter.rating = feedbackRatingFilter.value; loadFeedback(); });
+    const feedbackPromptFilter = $('#feedbackPromptFilter');
+    if (feedbackPromptFilter) { let timer; feedbackPromptFilter.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(() => { state.feedbackFilter.prompt = feedbackPromptFilter.value.trim(); loadFeedback(); }, 300); }); }
+    const clearFeedbackFilters = $('#clearFeedbackFilters');
+    if (clearFeedbackFilters) clearFeedbackFilters.addEventListener('click', () => { state.feedbackFilter = { status: '', rating: '', prompt: '' }; loadFeedback(); });
     const saveFeedback = $('#saveFeedback');
     if (saveFeedback) saveFeedback.addEventListener('click', async () => {
       const logId = $('#feedback-logId').value.trim();
@@ -1177,6 +1582,14 @@
       try { await api(`/api/feedback/${encodeURIComponent(select.dataset.feedbackStatus)}`, { method: 'PUT', body: { status: select.value } }); toast('反馈状态已更新'); await loadFeedback(); }
       catch (error) { toast(error.message, true); }
     }));
+    $$('[data-feedback-link]').forEach(button => button.addEventListener('click', async () => {
+      const promptId = window.prompt('输入要修复的 Prompt ID');
+      if (!promptId) return;
+      const testCaseId = window.prompt('输入回归测试案例 ID（可留空）') || '';
+      const note = window.prompt('输入修复备注（可留空）') || '';
+      try { await api(`/api/feedback/${encodeURIComponent(button.dataset.feedbackLink)}/link`, { method: 'POST', body: { promptId, testCaseId, note } }); toast('反馈已关联修复目标'); await loadFeedback(); }
+      catch (error) { toast(error.message, 'error'); }
+    }));
     const reloadRules = $('#reloadRules');
     if (reloadRules) reloadRules.addEventListener('click', loadRules);
     $$('[data-rule-toggle]').forEach(button => button.addEventListener('click', async () => {
@@ -1195,11 +1608,14 @@
     const saveSettings = $('#saveSettings');
     if (saveSettings) saveSettings.addEventListener('click', async () => {
       const payload = { actor: '管理员' };
-      ['model', 'temperature', 'maxTokens', 'timeoutMs', 'retries', 'promptMaxChars', 'promptMaxCount', 'inputPricePerM', 'outputPricePerM', 'logRetentionDays', 'alertFailureRate', 'alertSchemaErrorRate', 'alertRetryRate', 'alertMinCalls'].forEach(key => {
+      ['model', 'temperature', 'maxTokens', 'timeoutMs', 'retries', 'promptMaxChars', 'promptMaxCount', 'inputPricePerM', 'outputPricePerM', 'dailyCostBudget', 'logRetentionDays', 'alertFailureRate', 'alertSchemaErrorRate', 'alertRetryRate', 'alertMinCalls', 'canaryFailureRate', 'canarySchemaErrorRate', 'canaryMinCalls'].forEach(key => {
         payload[key] = $('#s-' + key).value;
       });
       payload.analyzeEnabled = $('#s-analyzeEnabled').value === 'true';
       payload.alertNotificationsEnabled = $('#s-alertNotificationsEnabled').value === 'true';
+      payload.canaryAutoStop = $('#s-canaryAutoStop').value === 'true';
+      payload.releaseFreeze = $('#s-releaseFreeze').value === 'true';
+      payload.releaseFreezeReason = $('#s-releaseFreezeReason').value.trim();
       try {
         const data = await api('/api/settings', { method: 'PUT', body: payload });
         state.settings = data.settings;
@@ -1221,6 +1637,11 @@
 
   // 表格与时间线里的委托事件
   document.addEventListener('click', async event => {
+    const logDetail = event.target.closest('[data-log-detail]');
+    if (logDetail) {
+      await openLogDetail(logDetail.dataset.logDetail);
+      return;
+    }
     const drillButton = event.target.closest('[data-alert-drill]');
     if (drillButton) {
       state.logDays = Number(drillButton.dataset.alertDays) || 7;
@@ -1290,6 +1711,44 @@
       return void openHistory(target.dataset.id);
     }
 
+    if (act === 'release-comparison') {
+      event.preventDefault();
+      return void openReleaseComparison(target.dataset.id, target.dataset.version);
+    }
+
+    if (act === 'release-checklist') {
+      event.preventDefault();
+      return void openReleaseChecklist(target.dataset.id);
+    }
+
+    if (act === 'canary-start' || act === 'canary-stop' || act === 'canary-promote' || act === 'canary-traffic') {
+      const id = target.dataset.id;
+      try {
+        if (act === 'canary-start') {
+          const value = window.prompt('灰度流量百分比（1-100）', '10');
+          if (value === null) return;
+          await api(`/api/prompts/${encodeURIComponent(id)}/canary/start`, { method: 'POST', body: { trafficPercent: Number(value) } });
+          toast('灰度已启动');
+        } else if (act === 'canary-stop') {
+          if (!window.confirm('确认停止灰度？生产版本不会变化。')) return;
+          await api(`/api/prompts/${encodeURIComponent(id)}/canary/stop`, { method: 'POST', body: { reason: '管理员停止灰度' } });
+          toast('灰度已停止');
+        } else if (act === 'canary-promote') {
+          if (!window.confirm('确认将灰度版本全量发布到生产？')) return;
+          const data = await api(`/api/prompts/${encodeURIComponent(id)}/canary/promote`, { method: 'POST', body: { note: '灰度验证通过，全量发布' } });
+          toast(`已全量发布 ${data.prompt.publishedVersion}`);
+        } else {
+          const value = window.prompt('新的灰度流量百分比（1-100）', '10');
+          if (value === null) return;
+          await api(`/api/prompts/${encodeURIComponent(id)}/canary/traffic`, { method: 'PUT', body: { trafficPercent: Number(value) } });
+          toast('灰度流量已调整');
+        }
+        await refreshPrompts();
+        render();
+      } catch (error) { toast(error.message, true); }
+      return;
+    }
+
     if (act === 'toggle') {
       try {
         await api(`/api/prompts/${target.dataset.id}/toggle`, {
@@ -1305,10 +1764,12 @@
 
     if (act === 'submit-review' || act === 'reject-review' || act === 'publish') {
       const labels = { 'submit-review': '提交审核', 'reject-review': '驳回为草稿', publish: '发布到生产' };
+      const note = act === 'reject-review' ? window.prompt('请输入驳回理由（必填）', '') : labels[act];
+      if (act === 'reject-review' && !String(note || '').trim()) { toast('驳回审核必须填写理由', true); return; }
       if (!window.confirm(`确认${labels[act]}？`)) return;
       try {
         const data = await api(`/api/prompts/${target.dataset.id}/${act}`, {
-          method: 'POST', body: { actor: '管理员', note: labels[act] }
+          method: 'POST', body: { actor: '管理员', note: String(note || '').trim() }
         });
         await refreshPrompts();
         render();

@@ -231,10 +231,11 @@ async function main() {
     const edgeActive = await json(await call('/api/prompts/active'));
     check('边缘产物固化 Prompt 可用', Array.isArray(edgeActive.prompts) && edgeActive.prompts.length > 0,
       `${edgeActive.prompts.length} 条`);
-    check('边缘为只读模式', edgeActive.readOnly === true);
+    check('边缘管理模式已启用', edgeActive.readOnly === false);
 
     const edgeWrite = await call('/api/prompts', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
-    check('边缘写接口返回 501 READ_ONLY', edgeWrite.status === 501, (await json(edgeWrite)).code);
+    const edgeWriteBody = await json(edgeWrite);
+    check('数据库未绑定时明确返回不可用', edgeWrite.status === 503 && edgeWriteBody.code === 'STORAGE_UNAVAILABLE', edgeWriteBody.code);
 
     for (const p of ['/', '/admin', '/admin.js', '/styles.css', '/app.js']) {
       const res = await call(p);

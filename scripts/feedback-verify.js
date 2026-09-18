@@ -22,6 +22,11 @@ async function main() {
     const list = await call('/api/feedback');
     check('反馈列表不含 JD 或简历原文', list.body.items.length === 1 && !JSON.stringify(list.body.items).includes('RESUME') && !JSON.stringify(list.body.items).includes('"jd"'));
     check('反馈统计正确', list.body.stats.bad === 1 && list.body.stats.open === 1 && list.body.stats.byTag.some(item => item.tag === '事实错误'));
+    const prompts = await call('/api/prompts');
+    const promptId = prompts.body.items?.[0]?.id;
+    const linked = await call(`/api/feedback/${saved.body.item.id}/link`, 'POST', { promptId, note: '加入回归验证' });
+    check('反馈可以关联 Prompt 修复目标', linked.status === 200 && linked.body.item.loop?.promptId === promptId && linked.body.item.loop?.sourceVersion);
+    check('闭环关联不包含业务正文', !JSON.stringify(linked.body.item.loop).includes('RESUME') && !JSON.stringify(linked.body.item.loop).includes('JD'));
     const updated = await call(`/api/feedback/${saved.body.item.id}`, 'PUT', { status: 'resolved', rating: 'good' });
     check('可以更新反馈状态', updated.status === 200 && updated.body.item.status === 'resolved' && updated.body.item.rating === 'good');
     const filtered = await call('/api/feedback?status=resolved&rating=good');
