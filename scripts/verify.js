@@ -237,6 +237,16 @@ async function main() {
     const edgeWriteBody = await json(edgeWrite);
     check('数据库未绑定时明确返回不可用', edgeWrite.status === 503 && edgeWriteBody.code === 'STORAGE_UNAVAILABLE', edgeWriteBody.code);
 
+    const edgeState = { prompts: [{ id: 1, step: 1, stepKey: 'input', name: '输入材料校验', enabled: true, releaseStatus: 'published', publishedVersion: 'v1.0', version: 'v1.0' }], settings: {}, changes: [], rules: [], templates: [], feedback: [], testCases: [], promptTests: [], regressions: [] };
+    const fakeDb = { prepare: () => ({ bind: () => ({ first: async () => ({ value_json: JSON.stringify(edgeState) }), all: async () => ({ results: [] }) }) }) };
+    const edgeDependencies = await json(await handler.fetch(new Request('https://edge.local/api/dependencies'), { DB: fakeDb }));
+    check('边缘流程依赖契约完整', edgeDependencies.steps?.length === 8
+      && Array.isArray(edgeDependencies.steps[0].prompts?.[0]?.variables)
+      && typeof edgeDependencies.steps[0].workspaceCount === 'number'
+      && typeof edgeDependencies.steps[0].productionCount === 'number'
+      && Array.isArray(edgeDependencies.extensionPrompts)
+      && Array.isArray(edgeDependencies.enabledRules));
+
     for (const p of ['/', '/admin', '/admin.js', '/styles.css', '/app.js']) {
       const res = await call(p);
       const body = await res.text();

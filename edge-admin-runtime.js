@@ -161,7 +161,22 @@ async function handleEdgeAdmin(request, env, url) {
   if (method === 'GET' && pathname === '/api/rules') return json({ items: state.rules || [] });
   if (method === 'GET' && pathname === '/api/templates') return json({ items: state.templates || [], categories: [] });
   if (method === 'GET' && pathname === '/api/feedback') return json({ items: state.feedback || [], stats: { total: state.feedback?.length || 0, good: 0, bad: 0 } });
-  if (method === 'GET' && pathname === '/api/dependencies') return json({ steps: state.prompts.filter(p => p.step).map(p => ({ step: p.step, stepKey: p.stepKey, name: p.name, prompts: [edgePromptSummary(p)], covered: p.enabled, hasDraft: p.releaseStatus === 'draft' })), extensionPrompts: [], enabledRules: state.rules || [] });
+  if (method === 'GET' && pathname === '/api/dependencies') {
+    const steps = Array.from({ length: 8 }, (_, index) => {
+      const step = index + 1;
+      const prompts = state.prompts.filter(p => Number(p.step) === step).map(p => ({
+        id: p.id, name: p.name, enabled: !!p.enabled, releaseStatus: p.releaseStatus,
+        publishedVersion: p.publishedVersion, version: p.version, variables: [],
+        regressionCases: 0, latestRegression: null
+      }));
+      return { step, stepKey: prompts[0]?.stepKey || null, prompts, workspaceCount: prompts.length,
+        productionCount: prompts.filter(p => p.releaseStatus === 'published' && p.enabled).length,
+        covered: prompts.some(p => p.releaseStatus === 'published' && p.enabled),
+        hasDraft: prompts.some(p => p.releaseStatus !== 'published') };
+    });
+    const extensionPrompts = state.prompts.filter(p => p.step == null).map(p => ({ id: p.id, name: p.name, enabled: !!p.enabled, releaseStatus: p.releaseStatus }));
+    return json({ steps, extensionPrompts, enabledRules: state.rules || [] });
+  }
   if (method === 'GET' && pathname === '/api/test-cases') return json({ items: state.testCases || [] });
   if (method === 'GET' && pathname === '/api/prompt-tests') return json({ items: state.promptTests || [] });
   if (method === 'GET' && pathname === '/api/regressions') return json({ items: state.regressions || [] });
