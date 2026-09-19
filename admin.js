@@ -1237,8 +1237,14 @@
       ['model', 'prompt', 'role'].forEach(key => { if (state.logFilter[key]) params.set(key, state.logFilter[key]); });
       if (state.logFilter.minLatency) params.set('minLatency', String(state.logFilter.minLatency));
       const [stats, logs] = await Promise.all([api(`/api/logs/stats?${params}`), api(`/api/logs?${params}`)]);
-      state.logStats = stats;
-      state.logs = logs.items;
+      state.logStats = {
+        total: 0, failed: 0, days: state.logDays, avgLatency: 0, p50Latency: 0, p95Latency: 0, p99Latency: 0,
+        tokens: 0, cost: 0, retryRate: 0, retryCalls: 0, droppedCalls: 0, truncatedCalls: 0, avgInputChars: 0,
+        byCode: [], byModel: [], byPrompt: [], byPromptVersion: [], promptVersionTrends: [], schemaFields: [],
+        slowest: [], daily: [], alerts: [], alertHistory: [], filters: { models: [], prompts: [] }, ...stats
+      };
+      state.logStats.filters = { models: [], prompts: [], ...(state.logStats.filters || {}) };
+      state.logs = Array.isArray(logs.items) ? logs.items : [];
       render();
     } catch (error) { showConnError(`运行日志加载失败：${error.message}`); }
   }

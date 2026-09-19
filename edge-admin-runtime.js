@@ -82,6 +82,32 @@ function edgeQuality(rows, days) {
   const total = rows.length, failed = rows.filter(r => !r.ok).length;
   const latencies = rows.map(r => Number(r.latencyMs || 0)).sort((a, b) => a - b);
   const pct = n => latencies.length ? latencies[Math.min(latencies.length - 1, Math.floor(latencies.length * n))] : 0;
+  const models = [...new Set(rows.map(r => r.model).filter(Boolean))].sort();
+  const prompts = [...new Set(rows.flatMap(r => Array.isArray(r.prompts) ? r.prompts : []))].sort();
+  const byCode = {}, byModel = {}, byPrompt = {}, dailyByDay = {};
+  rows.forEach(row => {
+    const day = String(row.at || '').slice(0, 10) || new Date().toISOString().slice(0, 10);
+    const daily = dailyByDay[day] || { day, total: 0, failed: 0, tokens: 0, cost: 0, latencySum: 0, latencyCount: 0 };
+    daily.total += 1; if (!row.ok) daily.failed += 1;
+    daily.tokens += Number(row.usage?.total_tokens || 0); daily.cost += Number(row.cost || 0);
+    if (row.ok) { daily.latencySum += Number(row.latencyMs || 0); daily.latencyCount += 1; }
+    dailyByDay[day] = daily;
+    const model = row.model || 'unknown';
+    const modelBucket = byModel[model] || { model, total: 0, failed: 0, latencySum: 0, latencyCount: 0, tokens: 0, cost: 0 };
+    modelBucket.total += 1; if (!row.ok) modelBucket.failed += 1;
+    if (row.ok) { modelBucket.latencySum += Number(row.latencyMs || 0); modelBucket.latencyCount += 1; }
+    modelBucket.tokens += Number(row.usage?.total_tokens || 0); modelBucket.cost += Number(row.cost || 0); byModel[model] = modelBucket;
+    (Array.isArray(row.prompts) ? row.prompts : []).forEach(prompt => {
+      const bucket = byPrompt[prompt] || { prompt, calls: 0, failed: 0, truncated: 0, dropped: 0 };
+      bucket.calls += 1; if (!row.ok) bucket.failed += 1;
+      bucket.truncated += Array.isArray(row.truncated) && row.truncated.some(item => item.name === prompt) ? 1 : 0;
+      bucket.dropped += Array.isArray(row.dropped) && row.dropped.some(item => item.name === prompt) ? 1 : 0;
+      byPrompt[prompt] = bucket;
+    });
+    if (!row.ok) { const code = row.code || 'UNKNOWN'; byCode[code] = byCode[code] || { code, label: code, count: 0 }; byCode[code].count += 1; }
+  });
+  const daily = Object.values(dailyByDay).sort((a, b) => a.day.localeCompare(b.day)).map(item => ({ ...item, cost: Number(item.cost.toFixed(4)), avgLatency: item.latencyCount ? Math.round(item.latencySum / item.latencyCount) : 0 }));
+  const byModelRows = Object.values(byModel).map(item => ({ ...item, successRate: item.total ? Number(((item.total - item.failed) / item.total * 100).toFixed(1)) : 100, avgLatency: item.latencyCount ? Math.round(item.latencySum / item.latencyCount) : 0, cost: Number(item.cost.toFixed(4)) })).sort((a, b) => b.total - a.total);
   const overall = {
     calls: total, succeeded: total - failed, failed, successRate: total ? Number(((total - failed) / total * 100).toFixed(1)) : 100,
     failureRate: total ? Number((failed / total * 100).toFixed(1)) : 0, schemaErrorRate: 0,
@@ -91,7 +117,12 @@ function edgeQuality(rows, days) {
     tokens: rows.reduce((s, r) => s + Number(r.usage?.total_tokens || 0), 0),
     cost: Number(rows.reduce((s, r) => s + Number(r.cost || 0), 0).toFixed(4)), feedback: 0, positiveRate: null
   };
-  return { days, overall, byPrompt: [], byRole: [], alerts: [] };
+  return {
+    days, ...overall, daily, byCode: Object.values(byCode).sort((a, b) => b.count - a.count),
+    byModel: byModelRows, byPrompt: Object.values(byPrompt).sort((a, b) => b.calls - a.calls), byPromptVersion: [],
+    promptVersionTrends: [], schemaFields: [], slowest: rows.filter(r => r.ok).sort((a, b) => Number(b.latencyMs || 0) - Number(a.latencyMs || 0)).slice(0, 10),
+    filters: { models, prompts }, alerts: [], alertHistory: [], byRole: []
+  };
 }
 
 async function readRequestJson(request) {
