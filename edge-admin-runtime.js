@@ -31,7 +31,8 @@ async function saveEdgeState(env, state) {
 
 function edgePromptSummary(prompt) {
   const { content, ...item } = prompt;
-  return { ...item, contentPreview: String(content || '').slice(0, 100), contentLength: String(content || '').length };
+  const variables = Array.from(new Set(Array.from(String(content || '').matchAll(/\{\{\s*([a-zA-Z][\w]*)\s*\}\}/g), match => match[1])));
+  return { ...item, variables: prompt.variables || variables, contentPreview: String(content || '').slice(0, 100), contentLength: String(content || '').length };
 }
 
 function edgeOverview(state) {
@@ -145,13 +146,15 @@ async function handleEdgeAdmin(request, env, url) {
     const q = String(url.searchParams.get('q') || '').toLowerCase();
     const status = url.searchParams.get('status') || '';
     const type = url.searchParams.get('type') || '';
-    const items = state.prompts.filter(p => (!q || `${p.name} ${p.desc} ${p.content}`.toLowerCase().includes(q)) && (!status || p.releaseStatus === status) && (!type || p.type === type)).map(edgePromptSummary);
+    const statusMatch = status === 'on' ? p => p.enabled : status === 'off' ? p => !p.enabled : () => true;
+    const typeMatch = type === 'system' || type === 'task' ? p => p.type === type : () => true;
+    const items = state.prompts.filter(p => (!q || `${p.name} ${p.desc} ${p.content}`.toLowerCase().includes(q)) && statusMatch(p) && typeMatch(p)).map(edgePromptSummary);
     return json({ items, total: items.length });
   }
   if (method === 'GET' && promptMatch) {
     const prompt = state.prompts.find(p => String(p.id) === decodeURIComponent(promptMatch[1]));
     if (!prompt) return json({ error: 'Prompt 不存在', code: 'NOT_FOUND' }, 404);
-    return json({ prompt, versions: [] });
+    return json({ prompt: edgePromptSummary(prompt), versions: [] });
   }
   if (method === 'POST' && pathname === '/api/prompts') {
     const body = await readRequestJson(request); const now = new Date().toISOString();
@@ -197,7 +200,7 @@ async function handleEdgeAdmin(request, env, url) {
       const step = index + 1;
       const prompts = state.prompts.filter(p => Number(p.step) === step).map(p => ({
         id: p.id, name: p.name, enabled: !!p.enabled, releaseStatus: p.releaseStatus,
-        publishedVersion: p.publishedVersion, version: p.version, variables: [],
+        publishedVersion: p.publishedVersion, version: p.version, variables: edgePromptSummary(p).variables,
         regressionCases: 0, latestRegression: null
       }));
       return { step, stepKey: prompts[0]?.stepKey || null, prompts, workspaceCount: prompts.length,
