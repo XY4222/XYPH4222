@@ -276,6 +276,7 @@
     else if (state.route === 'rules') page.innerHTML = viewRules();
     else if (state.route === 'dependencies') page.innerHTML = viewDependencies();
     else page.innerHTML = viewSettings();
+    enhanceEmptyState();
     bindView();
     // viewPrompts() 只铺出空表格骨架，行要靠 renderRows 填。切走再切回来时
     // navigate() 因为 state.overview 已存在不会重新拉数据，这里不补一次，
@@ -284,6 +285,31 @@
   }
 
   function loading(text) { return `<div class="panel"><div class="loading">${escapeHtml(text || '加载中…')}</div></div>`; }
+
+  function emptyGuide(title, description, steps, actions = []) {
+    return `<div class="empty-guide"><div class="empty-guide-icon">◎</div><h3>${escapeHtml(title)}</h3><p>${escapeHtml(description)}</p><ol>${steps.map(step => `<li>${escapeHtml(step)}</li>`).join('')}</ol>${actions.length ? `<div class="actions">${actions.map(action => action.href ? `<a class="${action.primary ? 'primary' : 'secondary'}" href="${escapeHtml(action.href)}" target="_blank" rel="noopener">${escapeHtml(action.label)}</a>` : `<button class="${action.primary ? 'primary' : 'secondary'}" data-go-route="${escapeHtml(action.route)}">${escapeHtml(action.label)}</button>`).join('')}</div>` : ''}</div>`;
+  }
+
+  function enhanceEmptyState() {
+    if (state.route === 'dashboard' && Number(state.dashboard?.quality?.overall?.calls || 0) === 0 && !document.querySelector('#page .first-use-guide')) {
+      document.querySelector('#page')?.insertAdjacentHTML('afterbegin', emptyGuide('第一次使用，从一条真实链路开始', '后台不会自动生成演示指标。先完成一次真实分析，再回来查看运行、质量和成本数据。', ['打开用户端，填写目标岗位、JD 和简历并完成分析', '回到 Prompt 测试台，保存一个可重复运行的测试案例', '确认结果后再使用发布、灰度、回归和质量反馈功能'], [{ label: '打开用户端', href: '/', primary: true }, { label: '打开测试台', route: 'tests' }]));
+      const guide = document.querySelector('#page .empty-guide');
+      if (guide) guide.classList.add('first-use-guide');
+    }
+    const guides = {
+      experiments: ['还没有灰度实验', '实验数据只会在一个 Prompt 启动灰度后产生。', ['在 Prompt 总览编辑并保存一个工作草稿', '到测试台用真实案例比较草稿与生产版本', '审核并发布候选版本后，在发布中心启动灰度'], [{ label: '查看 Prompt', route: 'prompts' }, { label: '打开发布中心', route: 'releases', primary: true }]],
+      regressions: ['还没有回归结果', '回归中心不会自动造数，需要先建立可重复运行的测试案例。', ['打开 Prompt 测试台并选择目标 Prompt', '填写真实 JD 与简历，保存为测试案例', '运行回归测试集，结果会汇总到这里'], [{ label: '去测试台建立案例', route: 'tests', primary: true }]],
+      logs: ['还没有运行记录', '用户端完成真实分析后，这里才会记录模型、耗时、Token、成本和错误码。', ['打开用户端并填写目标岗位、JD 和简历', '点击开始分析并等待完成', '返回本页刷新查看运行记录'], [{ label: '打开用户端', href: '/', primary: true }]],
+      tasks: ['还没有分析任务', '任务中心展示用户端真实分析请求，不展示虚构的演示任务。', ['到用户端完成一次简历分析', '成功和失败请求都会形成任务记录', '返回本页查看状态、耗时和失败原因'], [{ label: '发起一次分析', href: '/', primary: true }]],
+      quality: ['还没有质量样本', '质量指标来自真实运行记录；至少先完成一次分析，更多样本后趋势才有意义。', ['到用户端运行一份真实 JD 与简历', '在运行日志确认请求已经入库', '积累样本后查看成功率、耗时、成本和版本对比'], [{ label: '打开用户端', href: '/', primary: true }, { label: '查看运行日志', route: 'logs' }]],
+      feedback: ['还没有人工反馈', '反馈必须关联真实运行记录，避免无法复现的问题描述。', ['先在用户端完成一次分析', '在运行日志复制对应的运行记录 ID', '回到本页新增“有效”或“需改进”反馈'], [{ label: '查看运行日志', route: 'logs', primary: true }]],
+      changes: ['还没有变更记录', '编辑、送审、发布 Prompt 或修改项目设置后，变更会自动记录。', ['到 Prompt 总览打开任意 Prompt', '修改正文并保存为草稿', '返回本页查看操作人、版本和备注'], [{ label: '编辑 Prompt', route: 'prompts', primary: true }]]
+    };
+    const guide = guides[state.route];
+    if (!guide) return;
+    const empty = Array.from(document.querySelectorAll('#page .empty')).find(node => /没有|暂无|尚无/.test(node.textContent));
+    if (empty) empty.outerHTML = emptyGuide(...guide);
+  }
 
   function viewDashboard() {
     const data = state.dashboard;
@@ -1322,6 +1348,7 @@
   /* ---------- 事件绑定 ---------- */
 
   function bindView() {
+    $$('[data-go-route]').forEach(button => button.addEventListener('click', () => navigate(button.dataset.goRoute)));
     // Prompt 总览
     const search = $('#search');
     if (search) {
