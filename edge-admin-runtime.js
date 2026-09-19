@@ -109,7 +109,7 @@ function edgeQuality(rows, days) {
   const daily = Object.values(dailyByDay).sort((a, b) => a.day.localeCompare(b.day)).map(item => ({ ...item, cost: Number(item.cost.toFixed(4)), avgLatency: item.latencyCount ? Math.round(item.latencySum / item.latencyCount) : 0 }));
   const byModelRows = Object.values(byModel).map(item => ({ ...item, successRate: item.total ? Number(((item.total - item.failed) / item.total * 100).toFixed(1)) : 100, avgLatency: item.latencyCount ? Math.round(item.latencySum / item.latencyCount) : 0, cost: Number(item.cost.toFixed(4)) })).sort((a, b) => b.total - a.total);
   const overall = {
-    calls: total, succeeded: total - failed, failed, successRate: total ? Number(((total - failed) / total * 100).toFixed(1)) : 100,
+    total, calls: total, succeeded: total - failed, failed, successRate: total ? Number(((total - failed) / total * 100).toFixed(1)) : 100,
     failureRate: total ? Number((failed / total * 100).toFixed(1)) : 0, schemaErrorRate: 0,
     retryRate: total ? Number((rows.filter(r => r.attempts > 1).length / total * 100).toFixed(1)) : 0,
     avgLatency: total ? Math.round(rows.reduce((s, r) => s + Number(r.latencyMs || 0), 0) / total) : 0,
