@@ -53,6 +53,12 @@
     return String(value == null ? '' : value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   }
 
+  function promptVariables(prompt) {
+    if (Array.isArray(prompt?.variables)) return prompt.variables;
+    const matches = String(prompt?.content || '').matchAll(/\{\{\s*([a-zA-Z][\w]*)\s*\}\}/g);
+    return [...new Set(Array.from(matches, match => match[1]))];
+  }
+
   function toast(message, isError) {
     const el = $('#toast');
     el.textContent = message;
@@ -455,7 +461,7 @@
           </select>
         </div>
         <table class="table">
-          <thead><tr><th>Prompt</th><th>类型</th><th>运行状态</th><th>发布状态</th><th>工作版本</th><th>生产版本</th><th>字数</th><th>最后更新</th><th></th></tr></thead>
+          <thead><tr><th>Prompt</th><th>类型</th><th>运行状态</th><th>发布状态</th><th>工作版本</th><th>生产版本</th><th>变量</th><th>字数</th><th>最后更新</th><th></th></tr></thead>
           <tbody id="rows"></tbody>
         </table>
         <div class="empty" id="empty" style="display:none">没有符合条件的 Prompt</div>
@@ -488,6 +494,7 @@
         <td>${release}</td>
         <td><span class="version">${escapeHtml(p.version)}</span></td>
         <td><span class="version">${escapeHtml(p.publishedVersion || '未发布')}</span></td>
+        <td>${promptVariables(p).length ? promptVariables(p).map(variable => tag(`{{${variable}}}`, 'blue')).join('') : '<span class="prompt-meta">未使用</span>'}</td>
         <td>${over ? `<span class="tag red" title="超出单条上限 ${maxChars} 字符，超出部分不会发给模型">${p.contentLength} 超限</span>` : `<span class="version">${p.contentLength}</span>`}</td>
         <td class="prompt-meta">${timeAgo(p.updatedAt)}</td>
         <td><div class="actions">
@@ -993,6 +1000,7 @@
           <label>Prompt 内容</label>
           <textarea id="f-content" required>${escapeHtml(p.content || '')}</textarea>
           <div class="hint" id="charHint"><span>超出 ${maxChars} 字符的部分不会发送给模型</span><span id="charCount">0 / ${maxChars}</span></div>
+          <div class="hint" id="variableHint">允许变量：{{role}}、{{jd}}、{{resume}}、{{industry}}、{{company}}、{{stage}}、{{extra}}；当前使用：${promptVariables(p).length ? promptVariables(p).map(variable => `{{${variable}}}`).join('、') : '无'}</div>
         </div>
         <div class="field"><label>状态</label>
           <select id="f-enabled">
@@ -1013,10 +1021,12 @@
     const textarea = $('#f-content');
     const counter = $('#charCount');
     const hint = $('#charHint');
+    const variableHint = $('#variableHint');
     const sync = () => {
       const len = textarea.value.length;
       counter.textContent = `${len} / ${maxChars}`;
       hint.classList.toggle('over', len > maxChars);
+      if (variableHint) variableHint.textContent = `允许变量：{{role}}、{{jd}}、{{resume}}、{{industry}}、{{company}}、{{stage}}、{{extra}}；当前使用：${promptVariables({ content: textarea.value }).map(variable => `{{${variable}}}`).join('、') || '无'}`;
     };
     textarea.addEventListener('input', sync);
     sync();
